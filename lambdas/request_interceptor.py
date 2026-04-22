@@ -25,11 +25,20 @@ import typing
 _LOGGER = logging.getLogger()
 _LOGGER.setLevel(logging.INFO)
 
-# tool name -> required scope
+# Unprefixed tool name -> required scope.
+# AgentCore namespaces tools per target as "<TargetName>___<tool>"
+# (triple underscore); we strip the prefix before looking up scopes.
 _TOOL_SCOPES: dict[str, str] = {
     "get_weather": "tool:get_weather",
     "get_time": "tool:get_time",
 }
+
+_TARGET_PREFIX_SEP = "___"
+
+
+def _unprefix_tool(name: str) -> str:
+    _, sep, tail = name.partition(_TARGET_PREFIX_SEP)
+    return tail if sep else name
 
 
 def _find_header(headers: dict, name: str) -> str:
@@ -60,7 +69,7 @@ def _has_tool_scope(scopes: list[str], tool_name: str) -> bool:
         return True
     if "tool:*" in scopes:
         return True
-    required = _TOOL_SCOPES.get(tool_name)
+    required = _TOOL_SCOPES.get(_unprefix_tool(tool_name))
     # Unknown tool: let the gateway handle it
     if required is None:
         return True

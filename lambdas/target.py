@@ -1,4 +1,18 @@
-"""Dummy MCP target Lambda - exposes get_weather and get_time tools."""
+"""MCP target Lambda — invoked by AgentCore Gateway for tools/call.
+
+AgentCore does all MCP/JSON-RPC framing itself.  Contract here:
+
+  event                                                    -> raw tool arguments dict
+  context.client_context.custom["bedrockAgentCoreToolName"]-> "<TargetName>___<tool>"
+                                                              (triple underscore)
+
+Return value -> HTTP-proxy shape: {"statusCode": 200, "body": <json-string>}.
+AgentCore unwraps `body` and emits it back to the MCP client inside a
+tools/call `result.content[].text` envelope.
+
+`initialize` and `tools/list` are NOT routed here — AgentCore answers those
+from the inline tool schema registered on the CfnGatewayTarget.
+"""
 
 import json
 import logging
@@ -9,116 +23,45 @@ from zoneinfo import ZoneInfo
 _LOGGER = logging.getLogger()
 _LOGGER.setLevel(logging.INFO)
 
+_TARGET_PREFIX_SEP = "___"
+
+
+def _unprefix_tool(name: str) -> str:
+    _, sep, tail = name.partition(_TARGET_PREFIX_SEP)
+    return tail if sep else name
+
+
+def _ok(payload: dict) -> dict:
+    return {"statusCode": 200, "body": json.dumps(payload)}
+
+
+def _error(code: int, message: str) -> dict:
+    return {"statusCode": code, "body": json.dumps({"error": message})}
+
 
 def handler(event: dict, context: typing.Any) -> dict:
-    _LOGGER.info("Target event: %s", json.dumps(event))
+    tool_name = ""
+    try:
+        if getattr(context, "client_context", None) is not None:
+            custom = context.client_context.custom or {}
+            tool_name = custom.get("bedrockAgentCoreToolName", "")
+    except Exception as exc:
+        _LOGGER.warning("Failed to read client_context: %s", exc)
 
-    mcp = event.get("mcp", {})
-    body = mcp.get("request", {}).get("body", {})
-    method = body.get("method", "")
+    _LOGGER.info("Target invoked: tool=%r args=%s", tool_name, json.dumps(event))
 
-    if method == "initialize":
-        return _mcp_result(
-            body.get("id"),
-            {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "mcp-auth-spike", "version": "0.1.0"},
-            },
-        )
+    unprefixed = _unprefix_tool(tool_name)
 
-    if method == "tools/list":
-        return _mcp_result(
-            body.get("id"),
-            {
-                "tools": [
-                    {
-                        "name": "get_weather",
-                        "description": "Get weather for a location",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"location": {"type": "string"}},
-                            "required": ["location"],
-                        },
-                    },
-                    {
-                        "name": "get_time",
-                        "description": "Get current time for a timezone",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"timezone": {"type": "string"}},
-                            "required": ["timezone"],
-                        },
-                    },
-                ]
-            },
-        )
+    if unprefixed == "get_weather":
+        location = event.get("location", "unknown")
+        return _ok({"weather": f"Weather in {location}: 72F, sunny"})
 
-    if method == "tools/call":
-        tool_name = body.get("params", {}).get("name", "")
-        arguments = body.get("params", {}).get("arguments", {})
+    if unprefixed == "get_time":
+        tz_name = event.get("timezone", "UTC")
+        try:
+            now = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return _ok({"time": f"Current time in {tz_name}: {now}"})
 
-        if tool_name == "get_weather":
-            location = arguments.get("location", "unknown")
-            return _mcp_result(
-                body.get("id"),
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Weather in {location}: 72F, sunny",
-                        }
-                    ]
-                },
-            )
-
-        if tool_name == "get_time":
-            tz_name = arguments.get("timezone", "UTC")
-            try:
-                now = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M:%S %Z")
-            except Exception:
-                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            return _mcp_result(
-                body.get("id"),
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Current time in {tz_name}: {now}",
-                        }
-                    ]
-                },
-            )
-
-    return _mcp_error(body.get("id"), -32601, f"Method not found: {method}")
-
-
-def _mcp_result(req_id: typing.Any, result: dict) -> dict:
-    return {
-        "mcp": {
-            "response": {
-                "body": {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": result,
-                }
-            }
-        }
-    }
-
-
-def _mcp_error(req_id: typing.Any, code: int, message: str) -> dict:
-    return {
-        "mcp": {
-            "response": {
-                "body": {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": code,
-                        "message": message,
-                    },
-                }
-            }
-        }
-    }
+    return _error(400, f"Unknown tool: {tool_name!r}")

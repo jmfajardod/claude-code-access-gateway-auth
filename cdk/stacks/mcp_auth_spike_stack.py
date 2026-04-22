@@ -192,66 +192,78 @@ class McpAuthSpikeStack(Stack):
                         pass_request_headers=True,
                     ),
                 ),
-                # agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(
-                #     interception_points=["RESPONSE"],
-                #     interceptor=agentcore.CfnGateway.InterceptorConfigurationProperty(
-                #         lambda_=agentcore.CfnGateway.LambdaInterceptorConfigurationProperty(
-                #             arn=response_interceptor.function_arn,
-                #         )
-                #     ),
-                #     input_configuration=agentcore.CfnGateway.InterceptorInputConfigurationProperty(
-                #         pass_request_headers=True,
-                #     ),
-                # ),
+                agentcore.CfnGateway.GatewayInterceptorConfigurationProperty(
+                    interception_points=["RESPONSE"],
+                    interceptor=agentcore.CfnGateway.InterceptorConfigurationProperty(
+                        lambda_=agentcore.CfnGateway.LambdaInterceptorConfigurationProperty(
+                            arn=response_interceptor.function_arn,
+                        )
+                    ),
+                    input_configuration=agentcore.CfnGateway.InterceptorInputConfigurationProperty(
+                        pass_request_headers=True,
+                    ),
+                ),
             ],
         )
 
-        # agentcore.CfnGatewayTarget(
-        #     self,
-        #     "TargetLambdaRegistration",
-        #     name="DummyToolsTarget",
-        #     gateway_identifier=gateway.attr_gateway_identifier,
-        #     description="Tool target for the MCP auth spike (get_weather, get_time)",
-        #     target_configuration=agentcore.CfnGatewayTarget.TargetConfigurationProperty(
-        #         mcp=agentcore.CfnGatewayTarget.McpTargetConfigurationProperty(
-        #             lambda_=agentcore.CfnGatewayTarget.McpLambdaTargetConfigurationProperty(
-        #                 lambda_arn=target_lambda.function_arn,
-        #                 tool_schema=agentcore.CfnGatewayTarget.ToolSchemaProperty(
-        #                     inline_payload=[
-        #                         agentcore.CfnGatewayTarget.ToolDefinitionProperty(
-        #                             name="get_weather",
-        #                             description="Get weather for a location",
-        #                             input_schema=agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
-        #                                 type="object",
-        #                                 properties={
-        #                                     "location": agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
-        #                                         type="string",
-        #                                         description="e.g. seattle, wa",
-        #                                     )
-        #                                 },
-        #                                 required=["location"],
-        #                             ),
-        #                         ),
-        #                         agentcore.CfnGatewayTarget.ToolDefinitionProperty(
-        #                             name="get_time",
-        #                             description="Get current time for a timezone",
-        #                             input_schema=agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
-        #                                 type="object",
-        #                                 properties={
-        #                                     "timezone": agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
-        #                                         type="string",
-        #                                         description="e.g. America/New_York",
-        #                                     )
-        #                                 },
-        #                                 required=["timezone"],
-        #                             ),
-        #                         ),
-        #                     ]
-        #                 ),
-        #             )
-        #         )
-        #     ),
-        # )
+        target_lambda.add_permission(
+            "AllowAgentCoreGatewayInvoke",
+            principal=iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=gateway.attr_gateway_arn,
+        )
+
+        agentcore.CfnGatewayTarget(
+            self,
+            "TargetLambdaRegistration",
+            name="DummyToolsTarget",
+            gateway_identifier=gateway.attr_gateway_identifier,
+            description="Tool target for the MCP auth spike (get_weather, get_time)",
+            credential_provider_configurations=[
+                agentcore.CfnGatewayTarget.CredentialProviderConfigurationProperty(
+                    credential_provider_type="GATEWAY_IAM_ROLE",
+                )
+            ],
+            target_configuration=agentcore.CfnGatewayTarget.TargetConfigurationProperty(
+                mcp=agentcore.CfnGatewayTarget.McpTargetConfigurationProperty(
+                    lambda_=agentcore.CfnGatewayTarget.McpLambdaTargetConfigurationProperty(
+                        lambda_arn=target_lambda.function_arn,
+                        tool_schema=agentcore.CfnGatewayTarget.ToolSchemaProperty(
+                            inline_payload=[
+                                agentcore.CfnGatewayTarget.ToolDefinitionProperty(
+                                    name="get_weather",
+                                    description="Get weather for a location",
+                                    input_schema=agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
+                                        type="object",
+                                        properties={
+                                            "location": agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
+                                                type="string",
+                                                description="e.g. seattle, wa",
+                                            )
+                                        },
+                                        required=["location"],
+                                    ),
+                                ),
+                                agentcore.CfnGatewayTarget.ToolDefinitionProperty(
+                                    name="get_time",
+                                    description="Get current time for a timezone",
+                                    input_schema=agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
+                                        type="object",
+                                        properties={
+                                            "timezone": agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
+                                                type="string",
+                                                description="e.g. America/New_York",
+                                            )
+                                        },
+                                        required=["timezone"],
+                                    ),
+                                ),
+                            ]
+                        ),
+                    )
+                )
+            ),
+        )
 
         cdk.CfnOutput(self, "OAuthServerUrl", value=oauth_api.url or "")
         cdk.CfnOutput(self, "GatewayArn", value=gateway.attr_gateway_arn)

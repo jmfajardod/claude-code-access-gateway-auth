@@ -127,8 +127,8 @@ sequenceDiagram
 | CDK stack | `cdk/stacks/mcp_auth_spike_stack.py` | All AWS resources (AgentCore Gateway, API Gateway v2, Lambdas, SSM) |
 | Stack settings | `cdk/stacks/settings.py` | `pydantic-settings` loader that reads `.env` |
 | OAuth server | `lambdas/oauth_server.py` | OIDC/AS discovery, login, Google OAuth callback, authorization code issuance, DCR |
-| Request interceptor | `lambdas/request_interceptor.py` | Scope-based tool access control |
-| Response interceptor | `lambdas/response_interceptor.py` | Stub (commented out in stack) |
+| Request interceptor | `lambdas/request_interceptor.py` | Blocks `tools/call` for tools the JWT caller lacks scope for |
+| Response interceptor | `lambdas/response_interceptor.py` | Filters `tools/list` responses to only tools the JWT caller has scope for |
 | Target Lambda | `lambdas/target.py` | Dummy MCP server (`get_weather`, `get_time`, MCP `2025-11-25`) |
 
 ### OAuth Lambda Endpoints
@@ -391,6 +391,88 @@ Restart Claude Desktop. On first connection it opens a browser for Google OAuth.
 
 ---
 
+## Scope-based tool access control
+
+The gateway has two interceptor Lambdas that together restrict which tools each user sees and can call, keyed off the `scope` claim in the Stytch Connected App JWT:
+
+| Interceptor | Hook | What it does |
+|---|---|---|
+| `lambdas/request_interceptor.py` | `REQUEST` | On `tools/call`, decodes the JWT, checks the `scope` claim, and short-circuits with a JSON-RPC error if the caller lacks the required scope for that tool. |
+| `lambdas/response_interceptor.py` | `RESPONSE` | On `tools/list`, decodes the JWT (from `pass_request_headers=True`) and drops tools the caller has no scope for, so they never appear in the client's tool picker. |
+
+Both use the same scope convention (`lambdas/request_interceptor.py:29`, `lambdas/response_interceptor.py:28`):
+
+| Scope in JWT | Effect |
+|---|---|
+| `tool:get_weather` | `get_weather` visible and callable |
+| `tool:get_time` | `get_time` visible and callable |
+| `tool:*` | all tools visible and callable |
+| no `tool:` scopes present | **default-open**: all tools visible and callable (useful before you configure any scopes — turn into default-deny by removing the `not any(s.startswith("tool:")...)` early-return in both files) |
+
+> The `tools/list` filter is cosmetic, not a security boundary. The authoritative check is the request interceptor on `tools/call` — always keep that in sync with the response filter.
+
+### Configure custom scopes in Stytch (B2B RBAC)
+
+In Stytch B2B, Connected Apps don't have a per-app "Scopes" tab. Custom scopes live in the **Project's RBAC Policy**. Scopes and Roles are siblings — both bundle **permissions** (a permission is a resource + action). At token-issue time Stytch intersects them: a member's token includes a scope only if every permission that scope declares is also granted by one of the member's roles.
+
+```
+Resource + Action ──► Permission ──► (consumed by both)
+                                     ├─► Scope  (included in OAuth token if…)
+                                     └─► Role   (…member's roles cover all the scope's permissions)
+        ↑                                            ↑
+        └── define once in RBAC Policy               └── assign to Member in Organization
+```
+
+Follow these steps in order:
+
+1. **Stytch Dashboard → RBAC Policy → Resources.** Create a resource for the MCP tools (e.g. `tools`) with one action per tool:
+   - `get_weather`
+   - `get_time`
+
+2. **Stytch Dashboard → RBAC Policy → Scopes.** Create one scope per access level and attach the matching permission(s). Pick names that match what the interceptors expect — the stack's interceptors look for `tool:get_weather`, `tool:get_time`, `tool:*`:
+   | Scope name | Permissions it grants |
+   |---|---|
+   | `tool:get_weather` | `tools.get_weather` |
+   | `tool:get_time` | `tools.get_time` |
+   | `tool:*` | `tools.*` |
+
+   Scope names are free-form strings; Stytch passes them through verbatim into the token's `scope` claim.
+
+3. **Stytch Dashboard → RBAC Policy → Roles.** Roles are bundles of **permissions**, not of scopes. Mirror each scope by giving the role the same permissions the scope needs — then that role "covers" the scope at token-issue time:
+   | Role | Permissions (resource.action) |
+   |---|---|
+   | `weather-user` | `tools.get_weather` |
+   | `time-user` | `tools.get_time` |
+   | `tools-admin` | `tools.*` |
+
+4. **Organizations → your org → Members → [member] → Roles.** Assign the right role to each member. A member's token will include exactly the scopes whose permissions are all covered by that member's roles — any scope requested by the client but not covered is silently dropped.
+
+5. **MCP client must request the scopes.** The client declares the scopes it wants during `/oauth/authorize`. For MCP Inspector and Claude Desktop this is part of the OAuth configuration. Example authorization URL:
+   ```
+   /oauth/authorize?client_id=<connected-app-id>
+                   &redirect_uri=...
+                   &response_type=code
+                   &code_challenge=...
+                   &scope=openid+email+tool:get_weather
+   ```
+   Scopes are space-delimited (URL-encoded as `+`). Stytch intersects "requested scopes" with "scopes granted by the member's roles" and puts the result in the token.
+
+6. **Verify** by decoding the resulting access token and checking the `scope` claim:
+   ```bash
+   python3 -c "
+   import base64, json, sys
+   payload = sys.argv[1].split('.')[1] + '=='
+   print(json.loads(base64.urlsafe_b64decode(payload)))
+   " <access_token>
+   ```
+   You should see e.g. `"scope": "openid email tool:get_weather"`. With that token, `tools/list` returns only `get_weather`, and `tools/call get_time` returns *"Insufficient scope for tool: get_time"*.
+
+> **Default-open fallback.** If a member's token contains **no** `tool:*` scope at all (for example because you haven't yet set up the RBAC policy, or the client didn't request any tool scopes), the current interceptors fall back to "allow everything" so the spike keeps working. Once the RBAC policy is the source of truth, flip the early-return in both `lambdas/request_interceptor.py` and `lambdas/response_interceptor.py` to enforce default-deny.
+
+> **Advertising the scopes (optional).** `lambdas/oauth_server.py` advertises `scopes_supported: ["openid", "email", "profile"]` in both `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`. MCP clients that gate requested scopes on this list (some Inspector versions do) won't include `tool:get_weather` unless you add the custom scopes here too. Clients that pass through a static `scope=` from config (e.g. Claude Desktop) don't need it. If in doubt, add them — it's a literal list change in `_as_metadata()` and `_oidc_discovery()`.
+
+---
+
 ## AWS Console Navigation
 
 | Resource | Path |
@@ -404,9 +486,6 @@ Restart Claude Desktop. On first connection it opens a browser for Google OAuth.
 ---
 
 ## Known Issues & Gotchas
-
-### `CfnGatewayTarget` commented out
-Gateway target registration and the response interceptor are commented out in the CDK stack. The gateway routes to the target Lambda directly via the `interceptor_configurations` block.
 
 ### Stytch values live in `.env`
 The Stytch project ID, org ID, public token, Connected App client ID, and the post-deploy URLs are read from `.env` by `cdk/stacks/settings.py` (`pydantic-settings`). The project secret is the only credential kept out of `.env` — it lives in SSM at `/mcp-spike/stytch/project_secret`. `.env` is gitignored; treat it as sensitive.
