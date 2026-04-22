@@ -108,9 +108,8 @@ sequenceDiagram
 
     Client->>Gateway: POST /mcp Authorization: Bearer <access_token>
     Note over Gateway,Stytch: Validates JWT against<br/>Stytch JWKS (/.well-known/jwks.json)
-    Gateway->>OAuthLambda: Request interceptor
-    OAuthLambda-->>Gateway: Authorised
-    Gateway-->>Client: MCP response (tools/list, etc.)
+    Note over Gateway: Interceptor chain:<br/>REQUEST interceptor → Target Lambda → RESPONSE interceptor<br/>(separate Lambdas from the OAuth Lambda above)
+    Gateway-->>Client: MCP response (tools/list filtered by JWT scope, etc.)
 ```
 
 **Key design decisions:**
@@ -346,7 +345,7 @@ You can also update the Connected App **Authorization endpoint** (step 1e) at th
 https://<api-id>.execute-api.<region>.amazonaws.com/oauth/authorize
 ```
 
-> If you ever change the OAuth server URL (for example, tearing the stack down and redeploying, or swapping between Lambda Function URL and API Gateway), you **must** update both URLs above in the Stytch Dashboard. Stytch's own OIDC discovery doc at `https://<slug>.customers.stytch.dev/.well-known/openid-configuration` exposes the Connected App Authorization URL as its `authorization_endpoint`, and MCP clients follow it verbatim. A stale URL there is the cause of the `Got message null {"Message":null}` error (the old Lambda Function URL returning `403 AccessDeniedException`).
+> If the API Gateway URL ever changes (tearing the stack down and redeploying, renaming the `OAuthApi` construct, etc.), you **must** update both URLs above in the Stytch Dashboard. Stytch's own OIDC discovery doc at `https://<slug>.customers.stytch.dev/.well-known/openid-configuration` exposes the Connected App Authorization URL as its `authorization_endpoint`, and MCP clients follow it verbatim — a stale value there leaves the client hitting a dead endpoint.
 
 ---
 
@@ -361,33 +360,28 @@ npx @modelcontextprotocol/inspector
 | Transport | Streamable HTTP |
 | URL | `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp` |
 
-Click **Connect**. AgentCore returns `401` + `WWW-Authenticate`. Inspector follows the OAuth discovery chain, opens a browser for Google login, completes the Stytch B2B Discovery flow, exchanges the authorization code for a Stytch Connected App access token, and reconnects. AgentCore validates the token and the connection succeeds. `tools/list` returns `get_weather` and `get_time`.
+Click **Connect**. AgentCore returns `401` + `WWW-Authenticate`. Inspector follows the OAuth discovery chain, opens a browser for Google login, completes the Stytch B2B Discovery flow, exchanges the authorization code for a Stytch Connected App access token, and reconnects. AgentCore validates the token and the connection succeeds. `tools/list` returns the target-namespaced tools (`DummyToolsTarget___get_weather`, `DummyToolsTarget___get_time`), filtered by the JWT's `scope` claim — see [Scope-based tool access control](#scope-based-tool-access-control) for how that filtering works.
 
 ---
 
 ## Testing with Claude Desktop
 
-On Linux, edit `~/.config/Claude/claude_desktop_config.json`:
+Claude Desktop has two code paths for MCP servers:
 
-```json
-{
-  "mcpServers": {
-    "mcp-auth-spike": {
-      "type": "http",
-      "url": "https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp",
-      "oauth": {
-        "clientId": "<connected-app-client-id>"
-      }
-    }
-  }
-}
-```
+| Server type | Configured via |
+|---|---|
+| Local stdio servers | `claude_desktop_config.json` (`~/.config/Claude/...` on Linux, `~/Library/Application Support/Claude/...` on macOS) |
+| **Remote HTTP servers with OAuth** (this stack) | **Settings → Connectors → Add custom connector** |
 
-On macOS the config file is at `~/Library/Application Support/Claude/claude_desktop_config.json`.
+Since this is an HTTP + OAuth MCP server, use the **Custom Connectors UI**, not `claude_desktop_config.json`:
 
-Restart Claude Desktop. On first connection it opens a browser for Google OAuth. After login it stores the token and reconnects automatically on subsequent starts.
+1. **Settings → Connectors → Add custom connector**.
+2. **URL**: `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp`
+3. Save. On first use Claude Desktop opens a browser for Google OAuth, stores the token, and reconnects automatically on subsequent starts.
 
-> **Prerequisite**: `https://claude.ai/api/mcp/auth_callback` must be registered as a Redirect URI in your Stytch Connected App (Setup step 1).
+The Custom Connectors UI has no field for custom scopes — Claude Desktop just requests `openid` at the moment. The OAuth Lambda compensates for this by server-side scope injection (see [Scope-based tool access control](#scope-based-tool-access-control) below).
+
+> **Prerequisite**: `https://claude.ai/api/mcp/auth_callback` must be registered as a Redirect URI in your Stytch Connected App (Setup step 1f).
 
 ---
 
@@ -400,7 +394,7 @@ The gateway has two interceptor Lambdas that together restrict which tools each 
 | `lambdas/request_interceptor.py` | `REQUEST` | On `tools/call`, decodes the JWT, checks the `scope` claim, and short-circuits with a JSON-RPC error if the caller lacks the required scope for that tool. |
 | `lambdas/response_interceptor.py` | `RESPONSE` | On `tools/list`, decodes the JWT (from `pass_request_headers=True`) and drops tools the caller has no scope for, so they never appear in the client's tool picker. |
 
-Both use the same scope convention (`lambdas/request_interceptor.py:29`, `lambdas/response_interceptor.py:28`):
+Both use the same scope convention (`lambdas/request_interceptor.py:31`, `lambdas/response_interceptor.py:39`). Tool names are namespaced by the target (`DummyToolsTarget___get_weather`); each interceptor strips the `___` prefix via `_unprefix_tool()` before looking up scopes.
 
 | Scope in JWT | Effect |
 |---|---|
@@ -447,15 +441,12 @@ Follow these steps in order:
 
 4. **Organizations → your org → Members → [member] → Roles.** Assign the right role to each member. A member's token will include exactly the scopes whose permissions are all covered by that member's roles — any scope requested by the client but not covered is silently dropped.
 
-5. **MCP client must request the scopes.** The client declares the scopes it wants during `/oauth/authorize`. For MCP Inspector and Claude Desktop this is part of the OAuth configuration. Example authorization URL:
+5. **No client-side scope request needed** (server auto-injects — see [Server-side scope injection](#scope-based-tool-access-control) below). By default `_oauth_authorize` in the OAuth Lambda appends every entry from `_CUSTOM_SCOPES` onto whatever the client requested, before forwarding to Stytch. Stytch then intersects that list with the scopes the member's roles actually cover, so each member gets exactly the tool scopes they're entitled to regardless of whether the client asked for them. This is what makes Claude Desktop (which has no scope config) work identically to Inspector. The resulting authorize call to Stytch looks like:
    ```
-   /oauth/authorize?client_id=<connected-app-id>
-                   &redirect_uri=...
-                   &response_type=code
-                   &code_challenge=...
-                   &scope=openid+email+tool:get_weather
+   scope=openid+tool:get_weather+tool:get_time+tool:*   (sent by the Lambda)
+   scope=openid+tool:get_weather                        (granted by Stytch for a weather-user)
    ```
-   Scopes are space-delimited (URL-encoded as `+`). Stytch intersects "requested scopes" with "scopes granted by the member's roles" and puts the result in the token.
+   If you prefer the client to be explicit (least-privilege), you can request scopes directly; they'll be merged with the auto-injected set.
 
 6. **Verify** by decoding the resulting access token and checking the `scope` claim:
    ```bash
@@ -467,9 +458,13 @@ Follow these steps in order:
    ```
    You should see e.g. `"scope": "openid email tool:get_weather"`. With that token, `tools/list` returns only `get_weather`, and `tools/call get_time` returns *"Insufficient scope for tool: get_time"*.
 
-> **Default-open fallback.** If a member's token contains **no** `tool:*` scope at all (for example because you haven't yet set up the RBAC policy, or the client didn't request any tool scopes), the current interceptors fall back to "allow everything" so the spike keeps working. Once the RBAC policy is the source of truth, flip the early-return in both `lambdas/request_interceptor.py` and `lambdas/response_interceptor.py` to enforce default-deny.
+> **Default-open fallback.** If a member's token contains **no scopes starting with `tool:`** (for example because you haven't set up the RBAC policy yet, or the member has no matching role), the current interceptors fall back to "allow everything" so the spike keeps working. Once the RBAC policy is the source of truth, flip the `if not any(s.startswith("tool:") for s in scopes): return True` early-return in both `lambdas/request_interceptor.py` and `lambdas/response_interceptor.py` to enforce default-deny.
 
-> **Advertising the scopes (optional).** `lambdas/oauth_server.py` advertises `scopes_supported: ["openid", "email", "profile"]` in both `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`. MCP clients that gate requested scopes on this list (some Inspector versions do) won't include `tool:get_weather` unless you add the custom scopes here too. Clients that pass through a static `scope=` from config (e.g. Claude Desktop) don't need it. If in doubt, add them — it's a literal list change in `_as_metadata()` and `_oidc_discovery()`.
+**Advertised scopes.** `lambdas/oauth_server.py` advertises `scopes_supported` in `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, and `/.well-known/oauth-protected-resource`. The list is `openid email profile` plus the custom scopes from `_DEFAULT_CUSTOM_SCOPES` (= `tool:get_weather`, `tool:get_time`, `tool:*`). Clients that gate requested scopes on DCR metadata (some Inspector versions do) will pick them up automatically.
+
+If you change the scope names in your RBAC policy, override the defaults with the `CUSTOM_SCOPES` env var on the OAuth Lambda (comma-separated, e.g. `tool:read,tool:write,tool:*`). No code change needed — just set the env var and redeploy.
+
+**Server-side scope injection (for clients that can't configure scopes).** Claude Desktop's remote Custom Connectors UI has no field for custom scopes, and it doesn't honour `scopes_supported` in DCR metadata — it always requests just `openid`. To make filtering work for Claude Desktop (and any other MCP client that ignores custom scopes), `_oauth_authorize` in `lambdas/oauth_server.py` unconditionally appends every entry from `_CUSTOM_SCOPES` to the `scopes` list it forwards to Stytch. Stytch then filters against the member's RBAC roles, so nobody gets a scope they aren't entitled to — the client just no longer needs to know what to ask for. Tradeoff: a client can't deliberately request *fewer* scopes than it's entitled to for least-privilege. RBAC remains the authoritative boundary. Look for `"Augmented client scopes"` in the OAuth Lambda logs to see this in action.
 
 ---
 
@@ -490,11 +485,23 @@ Follow these steps in order:
 ### Stytch values live in `.env`
 The Stytch project ID, org ID, public token, Connected App client ID, and the post-deploy URLs are read from `.env` by `cdk/stacks/settings.py` (`pydantic-settings`). The project secret is the only credential kept out of `.env` — it lives in SSM at `/mcp-spike/stytch/project_secret`. `.env` is gitignored; treat it as sensitive.
 
-### Stytch Connected App "Authorization URL" drifts after URL changes
-When the OAuth server URL changes (e.g. switching from Lambda Function URL to API Gateway, or a stack recreate), the Connected App **Authorization URL** and the Stytch **Redirect URLs** must be updated in the Stytch Dashboard. Stytch's OIDC discovery doc echoes the Authorization URL as its `authorization_endpoint`, and MCP clients follow that verbatim — a stale value leaves clients hitting a dead URL. Symptom: the MCP client prints `Got message null {"Message":null}` (the `403 AccessDeniedException` body returned by a removed Lambda Function URL).
+### Stytch Connected App "Authorization URL" drifts after stack recreate
+When the API Gateway URL changes (`cdk destroy` + `cdk deploy`, renaming the `OAuthApi` construct, etc.), the Connected App **Authorization URL** and the Stytch **Redirect URLs** must be updated in the Stytch Dashboard. Stytch's OIDC discovery doc echoes the Authorization URL as its `authorization_endpoint`, and MCP clients follow that verbatim — a stale value leaves clients hitting a dead URL (symptoms include a generic `{"Message":null}` / `403 AccessDeniedException` body if the old endpoint still resolves to some AWS service, or a connection failure if it doesn't).
 
 ### `authorize_start()` does not accept `state` or `code_challenge`
-The Stytch SDK's `idp.oauth.authorize_start()` only accepts `client_id`, `redirect_uri`, `response_type`, `scopes`, and `session_jwt`. The `state`, `code_challenge`, and `resources` parameters belong only to `idp.oauth.authorize()`. Passing them to `authorize_start()` causes a `TypeError` that silently clears the session cookie and loops back to `/login`.
+The Stytch SDK's `idp.oauth.authorize_start()` only accepts `client_id`, `redirect_uri`, `response_type`, `scopes`, and `session_jwt`. The `state`, `code_challenge`, and `resources` parameters belong only to `idp.oauth.authorize()`. Passing them to `authorize_start()` causes a `TypeError` that the OAuth Lambda catches; see next entry for how the error is surfaced.
+
+### `/oauth/authorize` error handling (no more infinite login loops)
+`_oauth_authorize` in `lambdas/oauth_server.py` catches Stytch SDK exceptions and classifies them via Stytch's `error_type`:
+
+| Class | Examples | Behavior |
+|---|---|---|
+| Session expired / invalid | `session_not_found`, `session_expired`, `invalid_session_jwt` | Clear the `stytch_session_jwt` cookie and redirect to `/login?returnTo=…`. |
+| Client-input error with a known `redirect_uri` | `oauth_invalid_scope_requested`, `oauth_unauthorized_client`, `oauth_invalid_request` | RFC 6749 §4.1.2.1 error redirect to the client's `redirect_uri` with `?error=<oauth-code>&error_description=…&state=…`. Session cookie is preserved. |
+| `redirect_uri`/`client_id` itself is bad | `connected_app_supplied_redirect_url_not_found_in_client`, `connected_app_not_found`, missing `redirect_uri` | Returns a `400 invalid_request` JSON error. Per RFC 6749 we *must not* redirect to an untrusted/missing `redirect_uri`. |
+| Anything else | — | Error-redirect to `redirect_uri` with `error=server_error`. |
+
+Historical symptom this replaces: an invalid scope (e.g. typo `tool:get_weathe`) used to clear the session cookie and bounce back to `/login`, which restarted Google OAuth → user appeared stuck on "Choose an account to continue to stytch.com". Now the client gets a proper OAuth error and can show a real failure message.
 
 ### AgentCore caches OIDC discovery
 If you change `jwks_uri` in the Lambda's discovery doc, AgentCore may continue using the cached value. Point `discovery_url` directly to Stytch's own OIDC endpoint (`https://<slug>.customers.stytch.dev/.well-known/openid-configuration`) — it is always authoritative. Note: the correct Stytch JWKS URL is `/.well-known/jwks.json`; the path `/v1/oauth2/jwks` returns 404.

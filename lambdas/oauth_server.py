@@ -71,6 +71,22 @@ _STYTCH_PUBLIC_TOKEN = os.environ["STYTCH_PUBLIC_TOKEN"]
 _STYTCH_SECRET_SSM_PATH = os.environ["STYTCH_PROJECT_SECRET_SSM_PATH"]
 _OAUTH_LAMBDA_URL = os.environ["OAUTH_LAMBDA_URL"].rstrip("/")
 
+# Custom OAuth scopes to advertise in the AS / OIDC / PRM metadata, on top of
+# the baseline OIDC scopes.  Clients that honour DCR metadata will then include
+# these in their authorize requests.  Mirror whatever you define in
+# Stytch Dashboard -> RBAC Policy -> Scopes.
+#
+# Override via CUSTOM_SCOPES env var (comma-separated) if you change the RBAC
+# policy without redeploying the whole stack.
+_BASELINE_SCOPES = ("openid", "email", "profile")
+_DEFAULT_CUSTOM_SCOPES = ("tool:get_weather", "tool:get_time", "tool:*")
+_CUSTOM_SCOPES: tuple[str, ...] = tuple(
+    s.strip()
+    for s in os.environ.get("CUSTOM_SCOPES", ",".join(_DEFAULT_CUSTOM_SCOPES)).split(",")
+    if s.strip()
+)
+_ADVERTISED_SCOPES: list[str] = [*_BASELINE_SCOPES, *_CUSTOM_SCOPES]
+
 # -- Cookie names ----------------------------------------------------------------
 _SESSION_COOKIE = "stytch_session_jwt"
 _RETURN_TO_COOKIE = "mcp_return_to"
@@ -189,6 +205,74 @@ def _google_oauth_start(login_redirect_url: str) -> str:
     return f"{_stytch_base_url()}/v1/b2b/public/oauth/google/discovery/start?{params}"
 
 
+# -- Stytch error classification --------------------------------------------------
+#
+# RFC 6749 §4.1.2.1: on authorization failure, redirect to the client's
+# redirect_uri with ?error=...&error_description=...&state=..., EXCEPT when the
+# redirect_uri itself (or the client_id) is invalid — in that case we must NOT
+# redirect and instead surface the error directly.
+#
+# We inspect Stytch SDK exceptions (they carry .error_type) to decide:
+#   - is this a session-level failure (clear cookie, send user back to /login)?
+#   - is this a client-input failure (redirect to client's redirect_uri w/ error)?
+#   - is this a redirect_uri/client failure (cannot redirect; return JSON error)?
+
+# Error types that indicate the redirect_uri or client_id themselves are bad,
+# so bouncing back to redirect_uri would be unsafe or impossible.
+_NO_SAFE_REDIRECT_ERROR_TYPES = frozenset({
+    "connected_app_supplied_redirect_url_not_found_in_client",
+    "connected_app_not_found",
+    "client_not_found",
+    "oauth_invalid_client",
+})
+
+# Stytch error_type -> (OAuth 2.0 error code, http status to log at)
+_STYTCH_TO_OAUTH_ERROR: dict[str, str] = {
+    "oauth_invalid_scope_requested": "invalid_scope",
+    "oauth_connected_app_scopes_required_but_not_granted": "invalid_scope",
+    "oauth_invalid_request": "invalid_request",
+    "oauth_unauthorized_client": "unauthorized_client",
+    "oauth_unsupported_response_type": "unsupported_response_type",
+    "oauth_access_denied": "access_denied",
+    "oauth_consent_required": "access_denied",
+}
+
+# Anything suggesting the user's session is gone/bad -> clear cookie, relogin.
+_SESSION_EXPIRED_ERROR_TYPES = frozenset({
+    "session_not_found",
+    "session_expired",
+    "unauthorized_credentials",
+    "invalid_session_jwt",
+    "invalid_session_token",
+    "session_jwt_expired",
+    "session_too_old_to_auth_factor",
+})
+
+
+def _stytch_error_type(exc: BaseException) -> str:
+    """Best-effort extraction of Stytch's error_type string from an SDK exception."""
+    t = getattr(exc, "error_type", None)
+    if isinstance(t, str) and t:
+        return t
+    details = getattr(exc, "original_json", None)
+    if isinstance(details, dict):
+        t = details.get("error_type")
+        if isinstance(t, str):
+            return t
+    return ""
+
+
+def _oauth_error_redirect(redirect_uri: str, state: str, error: str, description: str) -> dict:
+    """RFC 6749 §4.1.2.1 error redirect back to the client's redirect_uri."""
+    params = {"error": error}
+    if description:
+        params["error_description"] = description
+    if state:
+        params["state"] = state
+    sep = "&" if "?" in redirect_uri else "?"
+    return _redirect(f"{redirect_uri}{sep}{urllib.parse.urlencode(params)}")
+
+
 # -- Route handlers ---------------------------------------------------------------
 
 def _as_metadata() -> dict:
@@ -204,7 +288,7 @@ def _as_metadata() -> dict:
         "token_endpoint": f"{_STYTCH_PROJECT_DOMAIN}/v1/oauth2/token",
         "registration_endpoint": f"{_OAUTH_LAMBDA_URL}/register",
         "jwks_uri": f"{_STYTCH_PROJECT_DOMAIN}/.well-known/jwks.json",
-        "scopes_supported": ["openid", "email", "profile"],
+        "scopes_supported": _ADVERTISED_SCOPES,
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -224,6 +308,7 @@ def _oidc_discovery() -> dict:
         "token_endpoint": f"{_STYTCH_PROJECT_DOMAIN}/v1/oauth2/token",
         "registration_endpoint": f"{_OAUTH_LAMBDA_URL}/register",
         "jwks_uri": f"{_STYTCH_PROJECT_DOMAIN}/.well-known/jwks.json",
+        "scopes_supported": _ADVERTISED_SCOPES,
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -243,7 +328,7 @@ def _protected_resource_metadata() -> dict:
         "resource": _OAUTH_LAMBDA_URL,
         "authorization_servers": [_STYTCH_PROJECT_DOMAIN],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["openid", "email", "profile"],
+        "scopes_supported": _ADVERTISED_SCOPES,
     })
 
 
@@ -387,7 +472,24 @@ def _oauth_authorize(event: dict) -> dict:
     code_challenge = qs.get("code_challenge", "")
     resource = qs.get("resource", "")
 
-    scopes = [s for s in scope_str.split() if s]
+    requested_scopes = [s for s in scope_str.split() if s]
+
+    # Some MCP clients (notably Claude Desktop remote connectors) don't let you
+    # configure custom scopes and ignore `scopes_supported` from AS metadata, so
+    # they end up requesting only `openid` — resulting in tokens without any
+    # `tool:*` scope, which then bypasses the interceptors' scope filtering.
+    #
+    # To make filtering work uniformly across clients, we append every
+    # advertised custom scope here.  Stytch still filters against the member's
+    # RBAC roles, so a user only ever gets the scopes they're entitled to; this
+    # just removes the need for the client to know what to ask for.
+    scopes = list(dict.fromkeys([*requested_scopes, *_CUSTOM_SCOPES]))
+    if scopes != requested_scopes:
+        _LOGGER.info(
+            "Augmented client scopes: requested=%s -> sent-to-stytch=%s",
+            requested_scopes,
+            scopes,
+        )
 
     # authorize_start() does NOT accept state/code_challenge/code_challenge_method
     start_params: dict = dict(
@@ -425,9 +527,26 @@ def _oauth_authorize(event: dict) -> dict:
         return _redirect(auth_resp.redirect_uri)
 
     except Exception as exc:
-        _LOGGER.error("client.idp.oauth.authorize failed: %s", exc)
-        login_url = f"{_OAUTH_LAMBDA_URL}/login?returnTo={urllib.parse.quote(current_url)}"
-        return _redirect(login_url, cookies=[_clear_cookie(_SESSION_COOKIE)])
+        stytch_err = _stytch_error_type(exc)
+        err_message = getattr(exc, "error_message", None) or str(exc)
+        _LOGGER.error(
+            "idp.oauth.authorize failed: stytch_error_type=%r message=%s",
+            stytch_err,
+            err_message,
+        )
+
+        # 1) Session-level failure -> clear cookie, bounce to /login.
+        if stytch_err in _SESSION_EXPIRED_ERROR_TYPES:
+            login_url = f"{_OAUTH_LAMBDA_URL}/login?returnTo={urllib.parse.quote(current_url)}"
+            return _redirect(login_url, cookies=[_clear_cookie(_SESSION_COOKIE)])
+
+        # 2) redirect_uri or client_id is itself bad -> cannot safely redirect.
+        if stytch_err in _NO_SAFE_REDIRECT_ERROR_TYPES or not redirect_uri:
+            return _error(400, "invalid_request", err_message or stytch_err or "Authorization failed")
+
+        # 3) Client-input failure we can surface via the standard OAuth error redirect.
+        oauth_err = _STYTCH_TO_OAUTH_ERROR.get(stytch_err, "server_error")
+        return _oauth_error_redirect(redirect_uri, state, oauth_err, err_message)
 
 
 # -- Lambda entry point ----------------------------------------------------------
