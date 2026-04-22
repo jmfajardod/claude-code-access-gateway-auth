@@ -1,0 +1,5 @@
+# stytch>=13.19.0 required for client.idp.oauth.authorize_start / authorize
+stytch>=13.19.0
+cryptography>=45.0.0
+boto3>=1.41.0
+pydantic>=2.10.0
