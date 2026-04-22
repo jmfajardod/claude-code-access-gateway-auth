@@ -122,7 +122,8 @@ sequenceDiagram
 
 | Component | File | Purpose |
 |---|---|---|
-| CDK stack | `cdk/stacks/mcp_auth_spike_stack.py` | All AWS resources |
+| CDK stack | `cdk/stacks/mcp_auth_spike_stack.py` | All AWS resources (AgentCore Gateway, OAuth Lambda + Function URL, interceptors, SSM) |
+| Stack settings | `cdk/stacks/settings.py` | `pydantic-settings` loader that reads `.env` |
 | OAuth server | `lambdas/oauth_server.py` | OIDC/AS discovery, login, Google OAuth callback, authorization code issuance, DCR |
 | Request interceptor | `lambdas/request_interceptor.py` | Scope-based tool access control |
 | Response interceptor | `lambdas/response_interceptor.py` | Stub (commented out in stack) |
@@ -149,13 +150,16 @@ sequenceDiagram
 │   ├── cdk.json
 │   ├── requirements.txt
 │   └── stacks/
-│       └── mcp_auth_spike_stack.py
+│       ├── mcp_auth_spike_stack.py
+│       └── settings.py
 ├── lambdas/
 │   ├── oauth_server.py
 │   ├── request_interceptor.py
 │   ├── response_interceptor.py
 │   ├── target.py
 │   └── requirements.txt
+├── .env.example         # template — copy to .env and fill in
+├── .gitignore
 ├── pyproject.toml
 ├── uv.lock
 └── README.md
@@ -178,6 +182,37 @@ aws --version && python3 --version && node --version && uv --version && docker i
 ---
 
 ## Setup
+
+### Stytch project — end-to-end checklist
+
+When spinning up a fresh Stytch B2B project, run through these steps in order. Each step links to the detailed instructions further down. Steps marked **(pre-deploy)** can be done before `cdk deploy`; steps marked **(post-deploy)** need the URLs that the first deploy prints.
+
+**Pre-deploy (Stytch Dashboard):**
+
+1. **Create the B2B project** (test env is fine) → from *Dashboard → API Keys* copy **Project ID**, **Project Domain**, **Public Token**, and **Secret**. → [1a](#1a--create-project--note-credentials)
+2. **Enable Google OAuth** → *Dashboard → OAuth → Google*. Supply Google Cloud OAuth client ID + secret. → [1b](#1b--enable-google-oauth)
+3. **Create an Organization** → *Dashboard → Organizations → Create organization*. Copy the **Organization ID**. → [1c](#1c--create-an-organization)
+4. **Invite members** → add the Google account(s) you will log in with. Required — without it the discovery exchange returns `invalid_intermediate_session_token_for_organization`. → [1d](#1d--add-members-to-the-org)
+5. **Create a Public Connected App** → *Dashboard → Connected Apps → Create app → Public*. Copy the **Client ID**. Authorization URL can be left as a placeholder for now (it is updated in step 10). → [1e](#1e--create-a-connected-app)
+6. **Register MCP client redirect URIs** on the Connected App (Inspector: `http://localhost:6274/oauth/callback`, Claude Desktop: `https://claude.ai/api/mcp/auth_callback`, plus any others you use). → [1f](#1f--register-connected-app-redirect-uris)
+
+**Pre-deploy (AWS + local):**
+
+7. **Store the Stytch secret in SSM** at `/mcp-spike/stytch/project_secret` (SecureString). → [2](#2--ssm-parameter)
+8. **Copy `.env.example` → `.env`** and fill in the Stytch values from steps 1–5. Leave `OAUTH_LAMBDA_URL` and `AGENTCORE_GATEWAY_URL` as placeholders. → [3](#3--configure-the-stack)
+9. **First `cdk deploy`** → note the `OAuthServerUrl` (Lambda Function URL) and `GatewayArn` outputs. → [4](#4--deploy)
+
+**Post-deploy (Stytch Dashboard + redeploy):**
+
+10. **Set the Connected App Authorization URL** to `<OAuthServerUrl>oauth/authorize`. Stytch reads this on every request; no redeploy needed for this change. → [1e](#1e--create-a-connected-app)
+11. **Add the Login callback** at *Dashboard → Redirect URLs* (top-level, **not** inside the Connected App): `<OAuthServerUrl>login/callback`, type **Login**, status **Enabled**. → [5](#5--add-login-callback-to-stytch-redirect-urls)
+12. **Fill in `OAUTH_LAMBDA_URL` and `AGENTCORE_GATEWAY_URL`** in `.env` from the deploy outputs, then **redeploy** (`cdk deploy`) so the OAuth Lambda learns its own URL and AgentCore picks up the correct `allowed_audience`. → [4](#4--deploy)
+
+After step 12 the flow is ready to test with [MCP Inspector](#testing-with-mcp-inspector) or [Claude Desktop](#testing-with-claude-desktop).
+
+> **Re-creating the stack changes the Function URL.** When that happens, redo steps 10 and 11 with the new URL, otherwise clients will hit the stale endpoint via Stytch's OIDC discovery doc and see `Got message null {"Message":null}` (the `403 AccessDeniedException` body returned by the removed Function URL).
+
+---
 
 ### 1 — Stytch B2B Console
 
@@ -245,32 +280,30 @@ aws ssm put-parameter \
 
 ### 3 — Configure the Stack
 
-Edit `cdk/stacks/mcp_auth_spike_stack.py` — fill in the Stytch values in the `OAuthServerLambda` environment block:
+Copy `.env.example` → `.env` and fill in the Stytch values. `cdk/stacks/settings.py` loads these via `pydantic-settings` and passes them into the stack:
 
-```python
-environment={
-    "STYTCH_PROJECT_ID":              "<project-test-...>",
-    "STYTCH_PROJECT_DOMAIN":          "https://<slug>.customers.stytch.dev",
-    "STYTCH_ORG_ID":                  "<organization-test-...>",
-    "STYTCH_PUBLIC_TOKEN":            "<public-token-test-...>",
-    "STYTCH_PROJECT_SECRET_SSM_PATH": "/mcp-spike/stytch/project_secret",
-    "CONNECTED_APP_CLIENT_ID":        "<connected-app-test-...>",
-}
+```bash
+cp .env.example .env
 ```
 
-Set `discovery_url` in `CustomJWTAuthorizerConfigurationProperty` to Stytch's own OIDC discovery endpoint — **not** the Lambda's endpoint — to ensure AgentCore always resolves the correct `jwks_uri`:
+```ini
+# Stytch B2B project (from Dashboard → API Keys)
+STYTCH_PROJECT_ID=project-test-...
+STYTCH_PROJECT_DOMAIN=https://<slug>.customers.stytch.dev
+STYTCH_ORG_ID=organization-test-...
+STYTCH_PUBLIC_TOKEN=public-token-test-...
 
-```python
-discovery_url="https://<slug>.customers.stytch.dev/.well-known/openid-configuration",
+# Connected App (from Dashboard → Connected Apps → your app)
+CONNECTED_APP_CLIENT_ID=connected-app-test-...
+
+# Filled in after the first deploy (see CDK outputs)
+OAUTH_LAMBDA_URL=
+AGENTCORE_GATEWAY_URL=
 ```
 
-Set `allowed_audience` to the AgentCore Gateway MCP URL:
+On the first deploy, leave `OAUTH_LAMBDA_URL` and `AGENTCORE_GATEWAY_URL` as the placeholders shown in `.env.example`. Deploy once to learn the real URLs, then fill them in and redeploy.
 
-```python
-allowed_audience=[
-    "https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp",
-],
-```
+The stack automatically points AgentCore's `discovery_url` at Stytch's own OIDC discovery endpoint (`{STYTCH_PROJECT_DOMAIN}/.well-known/openid-configuration`) — Stytch is always authoritative for the JWKS. `allowed_audience` is set from `AGENTCORE_GATEWAY_URL` so Connected Apps tokens whose `aud` claim matches the MCP server URL are accepted.
 
 ### 4 — Deploy
 
@@ -286,10 +319,12 @@ CDK outputs:
 
 | Output | Description |
 |---|---|
-| `OAuthServerUrl` | Lambda Function URL — OAuth server base |
-| `GatewayArn` | ARN of the AgentCore Gateway |
+| `OAuthServerUrl` | Lambda Function URL — OAuth server base (use this for `OAUTH_LAMBDA_URL` in `.env`) |
+| `GatewayArn` | ARN of the AgentCore Gateway. Look up the Gateway URL in the Bedrock console (*AgentCore → Gateways → McpAuthSpikeGateway*) — it has the form `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp`. Use that for `AGENTCORE_GATEWAY_URL` in `.env`. |
 | `RequestInterceptorArn` | ARN of the request interceptor Lambda |
 | `ResponseInterceptorArn` | ARN of the response interceptor Lambda |
+
+After filling in `OAUTH_LAMBDA_URL` and `AGENTCORE_GATEWAY_URL` in `.env`, run `cdk deploy` again so the OAuth Lambda picks up its own URL and AgentCore picks up the correct `allowed_audience`.
 
 ### 5 — Add Login Callback to Stytch Redirect URLs
 
@@ -308,6 +343,8 @@ You can also update the Connected App **Authorization endpoint** (step 1e) at th
 ```
 https://<lambda-url-id>.lambda-url.us-east-1.on.aws/oauth/authorize
 ```
+
+> If the OAuth server URL ever changes (for example after tearing the stack down and redeploying — the Function URL hash regenerates), you **must** update both URLs above in the Stytch Dashboard. Stytch's own OIDC discovery doc at `https://<slug>.customers.stytch.dev/.well-known/openid-configuration` exposes the Connected App Authorization URL as its `authorization_endpoint`, and MCP clients follow it verbatim. A stale URL there is the cause of the `Got message null {"Message":null}` error (the removed Function URL returning `403 AccessDeniedException`).
 
 ---
 
@@ -369,8 +406,11 @@ Restart Claude Desktop. On first connection it opens a browser for Google OAuth.
 ### `CfnGatewayTarget` commented out
 Gateway target registration and the response interceptor are commented out in the CDK stack. The gateway routes to the target Lambda directly via the `interceptor_configurations` block.
 
-### Stytch values hardcoded in stack
-The Stytch project ID, org ID, public token, and Connected App client ID are hardcoded in `mcp_auth_spike_stack.py`. Move these to SSM or environment config before sharing broadly.
+### Stytch values live in `.env`
+The Stytch project ID, org ID, public token, Connected App client ID, and the post-deploy URLs are read from `.env` by `cdk/stacks/settings.py` (`pydantic-settings`). The project secret is the only credential kept out of `.env` — it lives in SSM at `/mcp-spike/stytch/project_secret`. `.env` is gitignored; treat it as sensitive.
+
+### Stytch Connected App "Authorization URL" drifts after URL changes
+When the OAuth Lambda Function URL changes (stack recreate, logical-ID rename, or moving to a different fronting mechanism), the Connected App **Authorization URL** and the Stytch **Redirect URLs** must be updated in the Stytch Dashboard. Stytch's OIDC discovery doc echoes the Authorization URL as its `authorization_endpoint`, and MCP clients follow that verbatim — a stale value leaves clients hitting a dead URL. Symptom: the MCP client prints `Got message null {"Message":null}` (the `403 AccessDeniedException` body returned by a removed Function URL).
 
 ### `authorize_start()` does not accept `state` or `code_challenge`
 The Stytch SDK's `idp.oauth.authorize_start()` only accepts `client_id`, `redirect_uri`, `response_type`, `scopes`, and `session_jwt`. The `state`, `code_challenge`, and `resources` parameters belong only to `idp.oauth.authorize()`. Passing them to `authorize_start()` causes a `TypeError` that silently clears the session cookie and loops back to `/login`.
