@@ -4,6 +4,8 @@ from aws_cdk import (
     DockerImage,
     Duration,
     Stack,
+    aws_apigatewayv2 as apigwv2,
+    aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_bedrockagentcore as agentcore,
     aws_iam as iam,
     aws_lambda as lambda_,
@@ -93,17 +95,24 @@ class McpAuthSpikeStack(Stack):
 
         stytch_secret_param.grant_read(oauth_lambda)
 
-        oauth_fn_url = oauth_lambda.add_function_url(
-            auth_type=lambda_.FunctionUrlAuthType.NONE,
-            cors=lambda_.FunctionUrlCorsOptions(
-                allowed_origins=["*"],
-                allowed_methods=[lambda_.HttpMethod.ALL],
-                allowed_headers=["*"],
+        oauth_api = apigwv2.HttpApi(
+            self,
+            "OAuthApi",
+            api_name="McpAuthSpikeOAuthApi",
+            description="OAuth server for MCP Auth Spike",
+            cors_preflight=apigwv2.CorsPreflightOptions(
+                allow_origins=["*"],
+                allow_methods=[apigwv2.CorsHttpMethod.ANY],
+                allow_headers=["*"],
+            ),
+            default_integration=apigwv2_integrations.HttpLambdaIntegration(
+                "OAuthLambdaIntegration",
+                oauth_lambda,
             ),
         )
-        # Avoids a CDK circular dependency: Lambda -> FunctionUrl -> Lambda.
-        # The URL is stable as long as the Lambda logical ID (OAuthServerLambda) doesn't change.
-        # Set OAUTH_LAMBDA_URL in .env after the first deploy.
+        # Avoids a CDK circular dependency: Lambda env references API GW URL, but
+        # API GW integration references Lambda ARN.  Set OAUTH_LAMBDA_URL in .env
+        # after the first deploy (see CDK output: OAuthServerUrl).
         oauth_lambda.add_environment("OAUTH_LAMBDA_URL", settings.oauth_lambda_url)
 
         request_interceptor = lambda_.Function(
@@ -244,7 +253,7 @@ class McpAuthSpikeStack(Stack):
         #     ),
         # )
 
-        cdk.CfnOutput(self, "OAuthServerUrl", value=oauth_fn_url.url)
+        cdk.CfnOutput(self, "OAuthServerUrl", value=oauth_api.url or "")
         cdk.CfnOutput(self, "GatewayArn", value=gateway.attr_gateway_arn)
         cdk.CfnOutput(
             self,

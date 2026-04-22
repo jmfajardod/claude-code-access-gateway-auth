@@ -21,7 +21,7 @@ class StackSettings(BaseSettings):
     connected_app_client_id: str
 
     # AWS resource identifiers (populated after first CDK deploy)
-    oauth_lambda_url: str   # e.g. https://<id>.lambda-url.<region>.on.aws/
+    oauth_lambda_url: str   # e.g. https://<id>.execute-api.<region>.amazonaws.com/
     agentcore_gateway_url: str  # e.g. https://<id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp
 
     # CDK environment (optional — falls back to CDK defaults if not set)
