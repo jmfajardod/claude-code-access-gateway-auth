@@ -18,7 +18,8 @@ graph TB
         OAuthApi["API Gateway v2 (HTTP API)\nCORS-enabled"]
         OAuthLambda["OAuth Server Lambda\n(headless — pure redirects)"]
         ReqInterceptor["Request Interceptor Lambda\nscope-based access control"]
-        TargetLambda["Target Lambda\nget_weather · get_time\nMCP 2025-11-25"]
+        TargetLambda["Target Lambda\nget_weather · get_time · query_data\nMCP 2025-11-25"]
+        ResultsBucket["S3 Results Bucket\nsample_sales.csv"]
         SSM["SSM Parameter Store\n/mcp-spike/stytch/project_secret"]
     end
 
@@ -37,6 +38,7 @@ graph TB
     Gateway -->|"discover JWKS URI"| StytchOIDC
     Gateway -->|"authorised request"| ReqInterceptor
     ReqInterceptor --> TargetLambda
+    TargetLambda -->|"presigned GET URL\n(query_data)"| ResultsBucket
 
     Clients -->|"OAuth discovery\n& /oauth/authorize"| OAuthApi
     OAuthApi --> OAuthLambda
@@ -128,7 +130,9 @@ sequenceDiagram
 | OAuth server | `lambdas/oauth_server.py` | OIDC/AS discovery, login, Google OAuth callback, authorization code issuance, DCR |
 | Request interceptor | `lambdas/request_interceptor.py` | Blocks `tools/call` for tools the JWT caller lacks scope for |
 | Response interceptor | `lambdas/response_interceptor.py` | Filters `tools/list` responses to only tools the JWT caller has scope for |
-| Target Lambda | `lambdas/target.py` | Dummy MCP server (`get_weather`, `get_time`, MCP `2025-11-25`) |
+| Target Lambda | `lambdas/target.py` | Dummy MCP server (`get_weather`, `get_time`, `query_data`, MCP `2025-11-25`) |
+| Results bucket | `cdk/stacks/mcp_auth_spike_stack.py` (S3) | Hosts the seeded `sample_sales.csv` returned by `query_data` as a presigned URL |
+| Seed data generator | `cdk/assets/seed_sample_data.py` | Deterministic 2000-row sales CSV written under `cdk/assets/sample_data/` and uploaded via `BucketDeployment` |
 
 ### OAuth Lambda Endpoints
 
@@ -150,6 +154,9 @@ sequenceDiagram
 │   ├── app.py
 │   ├── cdk.json
 │   ├── requirements.txt
+│   ├── assets/
+│   │   ├── seed_sample_data.py   # deterministic 2000-row CSV generator
+│   │   └── sample_data/          # generated at synth time, uploaded via BucketDeployment
 │   └── stacks/
 │       ├── mcp_auth_spike_stack.py
 │       └── settings.py
@@ -360,7 +367,7 @@ npx @modelcontextprotocol/inspector
 | Transport | Streamable HTTP |
 | URL | `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp` |
 
-Click **Connect**. AgentCore returns `401` + `WWW-Authenticate`. Inspector follows the OAuth discovery chain, opens a browser for Google login, completes the Stytch B2B Discovery flow, exchanges the authorization code for a Stytch Connected App access token, and reconnects. AgentCore validates the token and the connection succeeds. `tools/list` returns the target-namespaced tools (`DummyToolsTarget___get_weather`, `DummyToolsTarget___get_time`), filtered by the JWT's `scope` claim — see [Scope-based tool access control](#scope-based-tool-access-control) for how that filtering works.
+Click **Connect**. AgentCore returns `401` + `WWW-Authenticate`. Inspector follows the OAuth discovery chain, opens a browser for Google login, completes the Stytch B2B Discovery flow, exchanges the authorization code for a Stytch Connected App access token, and reconnects. AgentCore validates the token and the connection succeeds. `tools/list` returns the target-namespaced tools (`DummyToolsTarget___get_weather`, `DummyToolsTarget___get_time`, `DummyToolsTarget___query_data`), filtered by the JWT's `scope` claim — see [Scope-based tool access control](#scope-based-tool-access-control) for how that filtering works.
 
 ---
 
@@ -400,6 +407,7 @@ Both use the same scope convention (`lambdas/request_interceptor.py:31`, `lambda
 |---|---|
 | `tool:get_weather` | `get_weather` visible and callable |
 | `tool:get_time` | `get_time` visible and callable |
+| `tool:query_data` | `query_data` visible and callable |
 | `tool:*` | all tools visible and callable |
 | no `tool:` scopes present | **default-open**: all tools visible and callable (useful before you configure any scopes — turn into default-deny by removing the `not any(s.startswith("tool:")...)` early-return in both files) |
 
@@ -422,12 +430,14 @@ Follow these steps in order:
 1. **Stytch Dashboard → RBAC Policy → Resources.** Create a resource for the MCP tools (e.g. `tools`) with one action per tool:
    - `get_weather`
    - `get_time`
+   - `query_data`
 
-2. **Stytch Dashboard → RBAC Policy → Scopes.** Create one scope per access level and attach the matching permission(s). Pick names that match what the interceptors expect — the stack's interceptors look for `tool:get_weather`, `tool:get_time`, `tool:*`:
+2. **Stytch Dashboard → RBAC Policy → Scopes.** Create one scope per access level and attach the matching permission(s). Pick names that match what the interceptors expect — the stack's interceptors look for `tool:get_weather`, `tool:get_time`, `tool:query_data`, `tool:*`:
    | Scope name | Permissions it grants |
    |---|---|
    | `tool:get_weather` | `tools.get_weather` |
    | `tool:get_time` | `tools.get_time` |
+   | `tool:query_data` | `tools.query_data` |
    | `tool:*` | `tools.*` |
 
    Scope names are free-form strings; Stytch passes them through verbatim into the token's `scope` claim.
@@ -437,14 +447,15 @@ Follow these steps in order:
    |---|---|
    | `weather-user` | `tools.get_weather` |
    | `time-user` | `tools.get_time` |
+   | `data-user` | `tools.query_data` |
    | `tools-admin` | `tools.*` |
 
 4. **Organizations → your org → Members → [member] → Roles.** Assign the right role to each member. A member's token will include exactly the scopes whose permissions are all covered by that member's roles — any scope requested by the client but not covered is silently dropped.
 
 5. **No client-side scope request needed** (server auto-injects — see [Server-side scope injection](#scope-based-tool-access-control) below). By default `_oauth_authorize` in the OAuth Lambda appends every entry from `_CUSTOM_SCOPES` onto whatever the client requested, before forwarding to Stytch. Stytch then intersects that list with the scopes the member's roles actually cover, so each member gets exactly the tool scopes they're entitled to regardless of whether the client asked for them. This is what makes Claude Desktop (which has no scope config) work identically to Inspector. The resulting authorize call to Stytch looks like:
    ```
-   scope=openid+tool:get_weather+tool:get_time+tool:*   (sent by the Lambda)
-   scope=openid+tool:get_weather                        (granted by Stytch for a weather-user)
+   scope=openid+tool:get_weather+tool:get_time+tool:query_data+tool:*   (sent by the Lambda)
+   scope=openid+tool:get_weather                                        (granted by Stytch for a weather-user)
    ```
    If you prefer the client to be explicit (least-privilege), you can request scopes directly; they'll be merged with the auto-injected set.
 
@@ -460,11 +471,101 @@ Follow these steps in order:
 
 > **Default-open fallback.** If a member's token contains **no scopes starting with `tool:`** (for example because you haven't set up the RBAC policy yet, or the member has no matching role), the current interceptors fall back to "allow everything" so the spike keeps working. Once the RBAC policy is the source of truth, flip the `if not any(s.startswith("tool:") for s in scopes): return True` early-return in both `lambdas/request_interceptor.py` and `lambdas/response_interceptor.py` to enforce default-deny.
 
-**Advertised scopes.** `lambdas/oauth_server.py` advertises `scopes_supported` in `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, and `/.well-known/oauth-protected-resource`. The list is `openid email profile` plus the custom scopes from `_DEFAULT_CUSTOM_SCOPES` (= `tool:get_weather`, `tool:get_time`, `tool:*`). Clients that gate requested scopes on DCR metadata (some Inspector versions do) will pick them up automatically.
+**Advertised scopes.** `lambdas/oauth_server.py` advertises `scopes_supported` in `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, and `/.well-known/oauth-protected-resource`. The list is `openid email profile` plus the custom scopes from `_DEFAULT_CUSTOM_SCOPES` (= `tool:get_weather`, `tool:get_time`, `tool:query_data`, `tool:*`). Clients that gate requested scopes on DCR metadata (some Inspector versions do) will pick them up automatically.
 
 If you change the scope names in your RBAC policy, override the defaults with the `CUSTOM_SCOPES` env var on the OAuth Lambda (comma-separated, e.g. `tool:read,tool:write,tool:*`). No code change needed — just set the env var and redeploy.
 
 **Server-side scope injection (for clients that can't configure scopes).** Claude Desktop's remote Custom Connectors UI has no field for custom scopes, and it doesn't honour `scopes_supported` in DCR metadata — it always requests just `openid`. To make filtering work for Claude Desktop (and any other MCP client that ignores custom scopes), `_oauth_authorize` in `lambdas/oauth_server.py` unconditionally appends every entry from `_CUSTOM_SCOPES` to the `scopes` list it forwards to Stytch. Stytch then filters against the member's RBAC roles, so nobody gets a scope they aren't entitled to — the client just no longer needs to know what to ask for. Tradeoff: a client can't deliberately request *fewer* scopes than it's entitled to for least-privilege. RBAC remains the authoritative boundary. Look for `"Augmented client scopes"` in the OAuth Lambda logs to see this in action.
+
+---
+
+## `query_data` tool — inline preview + presigned URL for large results
+
+The `query_data` tool is a spike toward an eventual `athena_query` that runs real SQL against the Glue Data Catalog. Since Athena result sets can be too large to inline in a tool response, the tool returns a **hybrid envelope**: enough data for the model to answer directly when it can (schema + sample rows), plus a short-lived **presigned S3 URL** for the full dataset when the user wants deep analysis.
+
+### Target UX: Claude.ai Projects + drag-drop + analysis tool
+
+The intended client is **Claude.ai Projects with the AgentCore Gateway connector** (not Claude Desktop — Claude Desktop lacks the in-sandbox analysis tool). End-state flow:
+
+1. User asks something like "What were our top 20 products by revenue in Q1 by region?" in a Project.
+2. Claude calls `query_data` (future: `athena_query(sql=...)`).
+3. The tool response is a single JSON text block with `{ schema, row_count, sample_rows, presigned_url, expires_in_seconds, next_step_suggestion }`.
+4. **For small results** (fits in context): Claude answers directly from `sample_rows`.
+5. **For large results**: Claude replies in prose — "I ran the query; it returned 2.3M rows. Here are the schema, sample, and summary. For full analysis, download from this link and drop the CSV into the chat." The model *shows* the presigned URL in the assistant message.
+6. User clicks the URL, downloads the CSV, drags it into the chat.
+7. Claude now has the file in-sandbox and uses the **analysis / code-execution tool (Python/pandas)** to aggregate, chart, and answer.
+
+The drag-drop step is the load-bearing UX bridge — it's the intended path, not a degraded fallback. Claude can't auto-fetch arbitrary HTTPS URLs from tool responses; the user's manual click-and-drop is what moves the file into the analysis sandbox.
+
+### Phase 1 (this branch): static CSV, no Athena
+
+- CDK provisions an S3 bucket (`QueryDataResultsBucket`) and uploads a deterministic 2000-row sales CSV (`cdk/assets/seed_sample_data.py` → `sample_sales.csv`) via `BucketDeployment`.
+- The target Lambda has `RESULTS_BUCKET`, `RESULTS_OBJECT_KEY`, `PRESIGNED_URL_TTL_SECONDS=300` env vars and `s3:GetObject` on the bucket.
+- On `tools/call query_data`, the Lambda reads the CSV, computes per-column summary statistics over all 2000 rows, generates a 5-minute presigned `get_object` URL, and returns the envelope:
+
+  ```json
+  {
+    "status": "success",
+    "row_count": 2000,
+    "summary_stats": {
+      "order_date":       { "min": "2025-01-01", "max": "2025-12-31", "distinct": 364, "nulls": 0 },
+      "region":           { "distinct": 4, "nulls": 0, "top": [{"value": "NA", "count": 511}, {"value": "LATAM", "count": 506}, "..."] },
+      "quantity":         { "min": 1.0, "max": 10.0, "mean": 5.45, "stddev": 2.83, "nulls": 0 },
+      "unit_price":       { "min": 12.92, "max": 1377.61, "mean": 209.42, "stddev": 279.98, "nulls": 0 },
+      "total_price":      { "min": 14.65, "max": 12105.36, "mean": 1138.34, "stddev": 1759.22, "nulls": 0 },
+      "customer_id":      { "distinct": 250, "nulls": 0 },
+      "...": "..."
+    },
+    "sample_rows": [
+      { "order_id": "ORD-00001", "order_date": "2025-03-13", "region": "NA", "channel": "Mobile", "product_category": "Electronics", "product": "Laptop", "quantity": "5", "unit_price": "1108.16", "total_price": "5540.80", "customer_id": "CUST-0189" }
+    ],
+    "full_results": {
+      "format": "csv",
+      "size_bytes": 204512,
+      "presigned_url": "https://...s3.amazonaws.com/sample_sales.csv?X-Amz-Signature=...",
+      "presigned_url_expires_at": "2026-04-23T15:05:00Z",
+      "presigned_url_ttl_seconds": 300,
+      "inline": false
+    },
+    "next_steps": "Returned 2,000 rows (~200 KB). Summary statistics and the first 50 rows are shown inline — use these for quick analysis. For full-row analysis, tell the user: download the CSV from `presigned_url` (expires in ~5 minutes) and drag it into this chat; the analysis tool can then process every row.",
+    "_meta": { "tool_version": "1.0.0-phase1" }
+  }
+  ```
+
+Per-column `summary_stats` are type-aware: numeric columns get `{min, max, mean, stddev, nulls}`; date columns get `{min, max, distinct, nulls}`; string columns get `{distinct, nulls}` plus `top` (up to 5 most-common values with counts) when cardinality is ≤ 30. High-cardinality string columns (IDs) correctly omit `top`.
+
+This matches the Phase 2 envelope shape — so Phase 1 is a dress-rehearsal of the end-state UX in Claude.ai Projects without waiting for Athena.
+
+### What to expect from different clients
+
+| Client | Behavior |
+|---|---|
+| **Claude.ai Projects** (target) | Model reads the envelope, answers inline from `sample_rows` when possible, or suggests the download-and-drop flow for full analysis. Once the CSV is dropped in, the analysis tool processes it in-sandbox. |
+| **MCP Inspector** | Shows the JSON envelope in the tool-call result panel. The `presigned_url` is clickable — lets you sanity-check the link works before pointing a real client at it. |
+| **Claude Desktop** | The model reads the envelope (schema, row_count, sample_rows, URL). It **cannot auto-fetch** the URL and has no analysis-tool sandbox, so it can only analyse what's already in `sample_rows`. For full-dataset analysis, the user has to manually open the URL in a browser — no in-chat analysis path. Use Claude.ai instead for that workflow. |
+
+### Phase 2 (future): real Athena + Glue
+
+- Create a Glue database + table over the same bucket (partitioning TBD).
+- Grant the target Lambda Athena (`StartQueryExecution`, `GetQueryExecution`, `GetQueryResults`) and extra S3 permissions for the Athena query-output prefix.
+- Rename the tool to `athena_query`, swap input from zero-arg to `{ "sql": "..." }`. Whitelist `SELECT`-only, add bounded row/byte-size caps, reject DDL/DML.
+- Replace `_read_seed_csv()` with: `start_query_execution` → poll `get_query_execution` until `SUCCEEDED` → `get_query_results` for the first N rows (for `sample_rows`) → presign the `ResultConfiguration.OutputLocation` key (Athena already writes CSV to S3).
+- Drive `summary_stats` from the actual Athena result (numeric min/max/mean/stddev via `GetQueryResults` pagination, or a second lightweight aggregate query for large results).
+- Extend the envelope with Athena execution metadata: top-level `query_execution_id`, `state` (`SUCCEEDED` / `FAILED`), and `statistics` (`{ data_scanned_bytes, engine_execution_time_ms, total_execution_time_ms }`). The Phase 1 fields (`status`, `row_count`, `summary_stats`, `sample_rows`, `full_results`, `next_steps`, `_meta`) stay shape-identical, so client UX doesn't break.
+
+### Sanity-check the tool end-to-end
+
+```bash
+# After `cdk deploy`, grab the bucket name from the stack output:
+aws cloudformation describe-stacks --stack-name McpAuthSpikeStack \
+  --query "Stacks[0].Outputs[?OutputKey=='QueryDataResultsBucketName'].OutputValue" --output text
+
+# Verify the seed CSV is there:
+aws s3 ls s3://<bucket-name>/
+
+# Call query_data via MCP Inspector. The tool-result panel should show the envelope;
+# click presigned_url — you should get a 200 and the CSV body.
+```
 
 ---
 

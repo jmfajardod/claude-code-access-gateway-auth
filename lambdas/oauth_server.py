@@ -79,7 +79,12 @@ _OAUTH_LAMBDA_URL = os.environ["OAUTH_LAMBDA_URL"].rstrip("/")
 # Override via CUSTOM_SCOPES env var (comma-separated) if you change the RBAC
 # policy without redeploying the whole stack.
 _BASELINE_SCOPES = ("openid", "email", "profile")
-_DEFAULT_CUSTOM_SCOPES = ("tool:get_weather", "tool:get_time", "tool:*")
+_DEFAULT_CUSTOM_SCOPES = (
+    "tool:get_weather",
+    "tool:get_time",
+    "tool:query_data",
+    "tool:*",
+)
 _CUSTOM_SCOPES: tuple[str, ...] = tuple(
     s.strip()
     for s in os.environ.get("CUSTOM_SCOPES", ",".join(_DEFAULT_CUSTOM_SCOPES)).split(",")

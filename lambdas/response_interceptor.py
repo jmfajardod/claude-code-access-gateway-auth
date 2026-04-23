@@ -39,6 +39,7 @@ _LOGGER.setLevel(logging.INFO)
 _TOOL_SCOPES: dict[str, str] = {
     "get_weather": "tool:get_weather",
     "get_time": "tool:get_time",
+    "query_data": "tool:query_data",
 }
 
 _TARGET_PREFIX_SEP = "___"

@@ -3,6 +3,7 @@ from aws_cdk import (
     BundlingOptions,
     DockerImage,
     Duration,
+    RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
@@ -10,13 +11,17 @@ from aws_cdk import (
     aws_iam as iam,
     aws_lambda as lambda_,
     aws_logs as logs,
+    aws_s3 as s3,
+    aws_s3_deployment as s3_deployment,
     aws_ssm as ssm,
 )
 from constructs import Construct
 
+from assets.seed_sample_data import ensure_sample_csv
 from stacks.settings import StackSettings
 
 LAMBDAS_DIR = "../lambdas"
+_SAMPLE_CSV_KEY = "sample_sales.csv"
 _PYTHON313_BUILD_IMAGE = DockerImage.from_registry(
     "public.ecr.aws/sam/build-python3.13"
 )
@@ -133,17 +138,43 @@ class McpAuthSpikeStack(Stack):
             **common_lambda_kwargs,
         )
 
+        results_bucket = s3.Bucket(
+            self,
+            "QueryDataResultsBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        sample_data_dir = ensure_sample_csv()
+        s3_deployment.BucketDeployment(
+            self,
+            "QueryDataSeedDeployment",
+            sources=[s3_deployment.Source.asset(str(sample_data_dir))],
+            destination_bucket=results_bucket,
+            prune=False,
+            retain_on_delete=False,
+        )
+
         target_lambda = lambda_.Function(
             self,
             "TargetLambda",
             handler="target.handler",
             code=_bundled_code(),
-            environment={},
+            environment={
+                "RESULTS_BUCKET": results_bucket.bucket_name,
+                "RESULTS_OBJECT_KEY": _SAMPLE_CSV_KEY,
+                "PRESIGNED_URL_TTL_SECONDS": "300",
+            },
             timeout=Duration.minutes(5),
             memory_size=256,
             runtime=lambda_.Runtime.PYTHON_3_13,
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
+
+        results_bucket.grant_read(target_lambda)
 
         gateway = agentcore.CfnGateway(
             self,
@@ -218,7 +249,7 @@ class McpAuthSpikeStack(Stack):
             "TargetLambdaRegistration",
             name="DummyToolsTarget",
             gateway_identifier=gateway.attr_gateway_identifier,
-            description="Tool target for the MCP auth spike (get_weather, get_time)",
+            description="Tool target for the MCP auth spike (get_weather, get_time, query_data)",
             credential_provider_configurations=[
                 agentcore.CfnGatewayTarget.CredentialProviderConfigurationProperty(
                     credential_provider_type="GATEWAY_IAM_ROLE",
@@ -258,6 +289,27 @@ class McpAuthSpikeStack(Stack):
                                         required=["timezone"],
                                     ),
                                 ),
+                                agentcore.CfnGatewayTarget.ToolDefinitionProperty(
+                                    name="query_data",
+                                    description=(
+                                        "Query the sales sample dataset. Returns a JSON envelope: "
+                                        "status, row_count, summary_stats (per-column: min/max/"
+                                        "mean/stddev for numeric, min/max/distinct for date, "
+                                        "distinct + top values for low-cardinality strings, nulls), "
+                                        "sample_rows (first 50 rows), full_results (format, "
+                                        "size_bytes, presigned_url, presigned_url_expires_at, "
+                                        "presigned_url_ttl_seconds, inline), next_steps. Use "
+                                        "summary_stats and sample_rows to answer directly when the "
+                                        "question can be answered from the preview. For questions "
+                                        "needing the whole dataset, tell the user to click "
+                                        "full_results.presigned_url, download the CSV, and drop it "
+                                        "into this chat so the analysis tool can process every row."
+                                    ),
+                                    input_schema=agentcore.CfnGatewayTarget.SchemaDefinitionProperty(
+                                        type="object",
+                                        properties={},
+                                    ),
+                                ),
                             ]
                         ),
                     )
@@ -267,6 +319,7 @@ class McpAuthSpikeStack(Stack):
 
         cdk.CfnOutput(self, "OAuthServerUrl", value=oauth_api.url or "")
         cdk.CfnOutput(self, "GatewayArn", value=gateway.attr_gateway_arn)
+        cdk.CfnOutput(self, "QueryDataResultsBucketName", value=results_bucket.bucket_name)
         cdk.CfnOutput(
             self,
             "RequestInterceptorArn",
