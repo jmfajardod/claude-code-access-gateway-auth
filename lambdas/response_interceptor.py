@@ -1,18 +1,23 @@
 """AgentCore Gateway RESPONSE interceptor.
 
-Two responsibilities:
+Three responsibilities:
 
 1. **tools/list filtering** — drops tools the JWT-holder has no scope for so
    unauthorised tools never appear in the client's picker.
 
-2. **tools/call content transform (experimental)** — for `query_data`, appends
-   a `resource_link` MCP content block alongside the existing text block,
-   exposing the presigned S3 URL as a first-class MCP resource. This probes
-   whether AgentCore accepts non-text content blocks in transformed responses,
-   and whether MCP clients (Inspector, Claude.ai, Claude Desktop) do anything
-   more useful with a `resource_link` than with the URL inside a text block.
-   If the transform is rejected or clients ignore it, reverting is a no-op —
-   the original text block is unchanged.
+2. **tools/call HTTP-proxy unwrap** — the target Lambda returns the AWS
+   HTTP-proxy shape `{"statusCode": 200, "body": "<envelope-json>"}` and
+   AgentCore passes it through unchanged, so `content[0].text` reaches clients
+   as a JSON-string-containing-a-JSON-string.  This step flattens it to just
+   the envelope string, giving the model a single parse step.  Applies to all
+   tools; shape-guarded so non-matching responses pass through.
+
+3. **tools/call resource_link injection (experimental)** — for `query_data`,
+   appends a `resource_link` MCP content block alongside the text block,
+   exposing the presigned S3 URL as a first-class MCP resource.  Accepted
+   end-to-end by AgentCore; currently refused by Claude.ai Projects with
+   "Resource links are not currently supported."  Left in place for when
+   Claude.ai ships support — reverting is a single-line change.
 
 Event shape (AgentCore RESPONSE interceptor, with pass_request_headers=True)
 ----------------------------------------------------------------------------
@@ -99,6 +104,37 @@ def _passthrough(status_code: int, body: typing.Any) -> dict:
         "interceptorOutputVersion": "1.0",
         "mcp": {"transformedGatewayResponse": out},
     }
+
+
+def _unwrap_http_proxy_shape(body: dict) -> dict:
+    """Flatten content[0].text from `{statusCode, body}` to just `body`.
+
+    Target Lambdas return the AWS HTTP-proxy shape, which AgentCore passes
+    through to the client verbatim — so every tool's text content reaches
+    the client double-wrapped.  We collapse one layer when the exact shape
+    matches; otherwise the response passes through untouched.
+    """
+    result = body.get("result")
+    if not isinstance(result, dict):
+        return body
+    content = result.get("content")
+    if not isinstance(content, list) or not content:
+        return body
+    first = content[0]
+    if not isinstance(first, dict) or first.get("type") != "text":
+        return body
+    try:
+        parsed = json.loads(first.get("text") or "")
+    except (json.JSONDecodeError, TypeError):
+        return body
+    if not (
+        isinstance(parsed, dict)
+        and "statusCode" in parsed
+        and isinstance(parsed.get("body"), str)
+    ):
+        return body
+    new_first = {**first, "text": parsed["body"]}
+    return {**body, "result": {**result, "content": [new_first, *content[1:]]}}
 
 
 def _append_query_data_resource_link(body: dict) -> dict:
@@ -218,12 +254,13 @@ def handler(event: dict, context: typing.Any) -> dict:
         }
         return _passthrough(status_code, new_body)
 
-    # --- tools/call: append resource_link for query_data only ------------------
+    # --- tools/call: unwrap HTTP-proxy shape, then tool-specific transforms ----
     if method == "tools/call":
+        transformed = _unwrap_http_proxy_shape(response_body)
         tool_name = (req_body.get("params") or {}).get("name", "")
         if _unprefix_tool(tool_name) == "query_data":
-            transformed = _append_query_data_resource_link(response_body)
-            return _passthrough(status_code, transformed)
+            transformed = _append_query_data_resource_link(transformed)
+        return _passthrough(status_code, transformed)
 
     # Everything else: pass through untouched
     return _passthrough(status_code, response_body)
