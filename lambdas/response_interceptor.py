@@ -34,13 +34,24 @@ AgentCore namespaces tools as "<TargetName>___<tool>" (triple underscore), so
 tools/list returns e.g. "DummyToolsTarget___get_weather".  We strip that prefix
 before looking up scopes.
 
+Default-DENY policy
+-------------------
+A tool is only visible to a caller whose JWT contains `tool:*` or the matching
+`tool:<name>` scope.  Tokens with only OIDC scopes see an empty `tools/list`.
+Mirror this with the request interceptor's `_has_tool_scope` so the picker
+matches what's actually callable.
+
 Scope convention
 ----------------
   tool:get_weather   -> tool visible
   tool:get_time      -> tool visible
   tool:query_data    -> tool visible
   tool:*             -> all tools visible
-  (no tool: scopes)  -> all tools visible (default)
+  (anything else)    -> hidden
+
+Tools not present in `_TOOL_SCOPES` are hidden (default-deny posture: a new
+tool added to the gateway's inline schema cannot be listed until its scope
+mapping is added here).
 """
 
 import base64
@@ -88,12 +99,13 @@ def _unprefix_tool(name: str) -> str:
 
 
 def _is_tool_visible(tool_name: str, scopes: list[str]) -> bool:
-    if not any(s.startswith("tool:") for s in scopes):
-        return True  # no tool scopes -> show all
+    """Default-deny: a tool is only visible if scopes grant it explicitly."""
     if "tool:*" in scopes:
         return True
     required = _TOOL_SCOPES.get(_unprefix_tool(tool_name))
-    return required is None or required in scopes
+    if required is None:
+        return False  # unknown tool — hide by default
+    return required in scopes
 
 
 def _passthrough(status_code: int, body: typing.Any) -> dict:

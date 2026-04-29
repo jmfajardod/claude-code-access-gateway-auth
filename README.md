@@ -409,9 +409,10 @@ Both use the same scope convention (`lambdas/request_interceptor.py:31`, `lambda
 | `tool:get_time` | `get_time` visible and callable |
 | `tool:query_data` | `query_data` visible and callable |
 | `tool:*` | all tools visible and callable |
-| no `tool:` scopes present | **default-open**: all tools visible and callable (useful before you configure any scopes — turn into default-deny by removing the `not any(s.startswith("tool:")...)` early-return in both files) |
+| no matching `tool:` scope | **default-deny**: tool hidden from `tools/list` and `tools/call` returns `Insufficient scope for tool: <name>` |
+| tool name not in `_TOOL_SCOPES` | denied — adding a tool to the gateway target's inline schema also requires updating `_TOOL_SCOPES` in both interceptors |
 
-> The `tools/list` filter is cosmetic, not a security boundary. The authoritative check is the request interceptor on `tools/call` — always keep that in sync with the response filter.
+> The `tools/list` filter is cosmetic, not a security boundary. The authoritative check is the request interceptor on `tools/call` — always keep `_TOOL_SCOPES` in sync between `request_interceptor.py` and `response_interceptor.py`.
 
 ### Configure custom scopes in Stytch (B2B RBAC)
 
@@ -469,7 +470,7 @@ Follow these steps in order:
    ```
    You should see e.g. `"scope": "openid email tool:get_weather"`. With that token, `tools/list` returns only `get_weather`, and `tools/call get_time` returns *"Insufficient scope for tool: get_time"*.
 
-> **Default-open fallback.** If a member's token contains **no scopes starting with `tool:`** (for example because you haven't set up the RBAC policy yet, or the member has no matching role), the current interceptors fall back to "allow everything" so the spike keeps working. Once the RBAC policy is the source of truth, flip the `if not any(s.startswith("tool:") for s in scopes): return True` early-return in both `lambdas/request_interceptor.py` and `lambdas/response_interceptor.py` to enforce default-deny.
+> **Default-deny posture.** A member whose token contains no `tool:*` scopes (no RBAC role configured, or roles whose permissions don't cover any scope) sees an empty `tools/list` and gets *"Insufficient scope for tool: <name>"* on every `tools/call`. Configure the RBAC policy and assign roles to members **before** users connect. The OAuth Lambda's server-side scope augmentation (see [Server-side scope injection](#scope-based-tool-access-control) below) only injects scopes into the *request* sent to Stytch — Stytch still intersects them with the member's roles, so injection alone never grants access a role doesn't already cover.
 
 **Advertised scopes.** `lambdas/oauth_server.py` advertises `scopes_supported` in `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, and `/.well-known/oauth-protected-resource`. The list is `openid email profile` plus the custom scopes from `_DEFAULT_CUSTOM_SCOPES` (= `tool:get_weather`, `tool:get_time`, `tool:query_data`, `tool:*`). Clients that gate requested scopes on DCR metadata (some Inspector versions do) will pick them up automatically.
 

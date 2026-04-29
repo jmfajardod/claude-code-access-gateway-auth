@@ -24,6 +24,15 @@ class StackSettings(BaseSettings):
     oauth_lambda_url: str   # e.g. https://<id>.execute-api.<region>.amazonaws.com/
     agentcore_gateway_url: str  # e.g. https://<id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp
 
+    # McpLambdaSpikeStack — separate API Gateway URL hosting the FastMCP server.
+    # Same two-pass deploy pattern as oauth_lambda_url: leave the placeholder for
+    # the first deploy, then fill in `<https://<id>.execute-api.<region>.amazonaws.com>`
+    # (the API Gateway base; the FastMCP app is mounted at /mcp).
+    mcp_server_url: str = ""
+
+    # Independent OAuth Lambda URL for McpLambdaSpikeStack (its own API Gateway).
+    mcp_oauth_lambda_url: str = ""
+
     # CDK environment (optional — falls back to CDK defaults if not set)
     cdk_default_account: str = ""
     cdk_default_region: str = "us-east-1"

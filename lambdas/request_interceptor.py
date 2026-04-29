@@ -5,12 +5,24 @@ CUSTOM_JWT authorizer already validated the signature, issuer, audience, and
 expiry).  Extracts the 'scope' claim and blocks tool invocations the user is
 not authorised to execute.
 
+Default-DENY policy
+-------------------
+A tool may only be called if the JWT contains either `tool:*` or the matching
+`tool:<name>` scope.  Tokens with only OIDC scopes (no `tool:*` scopes at all)
+get zero access — make sure your Stytch RBAC policy grants the right scopes
+before flipping a member into production.
+
 Scope convention
 ----------------
   tool:get_weather   -> may call get_weather
   tool:get_time      -> may call get_time
+  tool:query_data    -> may call query_data
   tool:*             -> may call any tool
-  (no tool: scopes)  -> allow all tools (default for tokens with only OIDC scopes)
+  (anything else)    -> denied
+
+Tools not present in `_TOOL_SCOPES` are also denied (default-deny posture: a
+new tool added to the gateway's inline schema cannot be called until its
+scope mapping is added here).
 
 For tools/call, unauthorized requests return a JSON-RPC error response
 (HTTP 200, short-circuits the Gateway so the backend Lambda is never invoked).
@@ -64,16 +76,14 @@ def _decode_jwt_claims(token: str) -> dict:
 
 
 def _has_tool_scope(scopes: list[str], tool_name: str) -> bool:
-    """Return True if scopes grant access to tool_name."""
-    # No tool-specific scopes present → allow all (token uses only OIDC scopes)
-    if not any(s.startswith("tool:") for s in scopes):
-        return True
+    """Return True if scopes grant access to tool_name (default-deny)."""
     if "tool:*" in scopes:
         return True
     required = _TOOL_SCOPES.get(_unprefix_tool(tool_name))
-    # Unknown tool: let the gateway handle it
+    # Unknown tool: deny by default — add it to _TOOL_SCOPES (and to the
+    # gateway target's inline schema) before it can be called.
     if required is None:
-        return True
+        return False
     return required in scopes
 
 
