@@ -257,11 +257,21 @@ Complete the following steps in [stytch.com](https://stytch.com) **before** runn
 
 1. Go to **Connected Apps → Create app**.
 2. Choose **Public** (no client secret — required for PKCE).
-3. Set the **Authorization endpoint** to your OAuth API Gateway URL + `oauth/authorize`:
+3. Set the **Authorization endpoint** (sometimes labelled "Authorization URL" — same field) to your OAuth API Gateway URL + `oauth/authorize`:
    ```
    https://<api-id>.execute-api.<region>.amazonaws.com/oauth/authorize
    ```
-   You will know this URL after the first CDK deploy (see step 4). Stytch reads this field on each request, so you can create the app now with a placeholder and update it after deploy — no redeploy required.
+   You will not know this URL until after the first CDK deploy (see step 4) — but the field **must not be empty before first deploy**. If it is empty, Stytch's `/.well-known/openid-configuration` returns HTTP 400 (`authorization_endpoint_not_configured_for_project`), and AgentCore Gateway creation fails with `OIDC discovery endpoint is not valid` during `cdk deploy`. Enter any well-formed HTTPS placeholder URL now, e.g.:
+   ```
+   https://placeholder.example.com/oauth/authorize
+   ```
+   Then verify the discovery doc is valid before deploying:
+   ```
+   curl -sS -o /dev/null -w "%{http_code}\n" \
+     https://<your-slug>.customers.stytch.dev/.well-known/openid-configuration
+   # expected: 200
+   ```
+   Stytch reads this field on each request, so you can update it to the real URL after deploy — no redeploy required.
 4. Note the **Client ID** (e.g. `connected-app-test-...`).
 
 #### 1f — Register Connected App redirect URIs

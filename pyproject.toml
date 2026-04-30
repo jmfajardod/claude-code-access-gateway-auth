@@ -22,6 +22,40 @@ lambdas = [
   "pydantic-core>=2.27.0",
   "pydantic-settings>=2.11.0",
 ]
+fastmcp-server = [
+  # Runs inside the ECS Fargate container (lambdas/mcp_fastmcp_server/).
+  # Mirrored in lambdas/mcp_fastmcp_server/requirements.txt — keep both in sync.
+  "fastmcp>=2.13.0,<3.0.0",
+  # py-key-value-aio is pulled in transitively by fastmcp; the [dynamodb]
+  # extra adds aioboto3 (which transitively pins boto3 — do NOT add an
+  # explicit boto3 pin in this group, it conflicts).  [wrappers-encryption]
+  # is defensive (FernetEncryptionWrapper) — already transitively available.
+  "py-key-value-aio[dynamodb,wrappers-encryption]",
+  # Pin aioboto3 below 14 — versions 14.x/15.x break the way
+  # DynamoDBStore enters the client context manager, surfacing as
+  # "RuntimeError: cannot reuse already awaited coroutine" on the first
+  # OAuth-state put.  py-key-value-aio's DynamoDBStore was developed
+  # against the 13.x API.  Revisit when the upstream fix lands.
+  "aioboto3<14",
+  "google-auth>=2.35.0",
+  "cryptography>=45.0.0",
+  "uvicorn[standard]>=0.32.0",
+  "httpx>=0.28.0",
+  "starlette>=0.41.0",
+]
 
 [tool.uv]
 package = false
+
+# `lambdas` and `fastmcp-server` ship to two different runtimes (Lambda vs
+# the Fargate container) with incompatible transitive boto3 constraints
+# (aioboto3 in py-key-value-aio[dynamodb] pins an older boto3 than the
+# Lambda group needs).  Declaring them as conflicting groups lets uv
+# resolve a separate dependency set for each instead of demanding one
+# unified resolution.
+conflicts = [
+    [
+        { group = "lambdas" },
+        { group = "fastmcp-server" },
+    ],
+]

@@ -1,0 +1,7 @@
+fastmcp>=2.13.0,<3.0.0
+py-key-value-aio[dynamodb,wrappers-encryption]
+aioboto3<14
+google-auth>=2.35.0
+cryptography>=45.0.0
+uvicorn[standard]>=0.32.0
+httpx>=0.28.0

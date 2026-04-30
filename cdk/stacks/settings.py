@@ -27,3 +27,27 @@ class StackSettings(BaseSettings):
     # CDK environment (optional — falls back to CDK defaults if not set)
     cdk_default_account: str = ""
     cdk_default_region: str = "us-east-1"
+
+    # ------------------------------------------------------------------
+    # McpFargateGoogleStack — FastMCP on ECS Fargate behind a public ALB
+    # with Google OAuth (FastMCP GoogleProvider OAuth Proxy).
+    # All fields below are optional: stack instantiation is skipped when
+    # mcp_public_hostname is empty.
+    # ------------------------------------------------------------------
+
+    # Public hostname the ALB will serve.  Must be a valid DNS hostname
+    # (no underscores) — ACM rejects underscored names during cert validation.
+    mcp_public_hostname: str = ""           # e.g. mcp.jmfajardo-test-mcp.com
+
+    # Route53 hosted zone that owns the apex of the hostname above.
+    # Must already exist in this AWS account; CDK will look it up at synth time.
+    route53_hosted_zone_name: str = ""      # e.g. jmfajardo-test-mcp.com
+
+    # Google OAuth 2.0 Web client_id (created manually in GCP Console).
+    # The client_secret is stored in Secrets Manager, NOT in .env.
+    google_client_id: str = ""
+
+    # Comma-separated list of Google Workspace domains allowed by the `hd`
+    # claim check.  For consumer Gmail the claim is absent — include "gmail.com"
+    # to allow it via fallback to the email domain.
+    allowed_workspace_domains: str = "gmail.com,boldcf.co"
