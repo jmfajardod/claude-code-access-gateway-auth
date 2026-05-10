@@ -291,6 +291,20 @@ async def query_data() -> dict:
 
 app = mcp.http_app()
 
+# CORS — MCP Inspector runs in the browser at http://localhost:6274 and makes
+# cross-origin fetches to /mcp, /register, /token, /.well-known/*. claude.ai
+# is server-to-server and doesn't need this, but Inspector and any browser
+# client do. Expose Mcp-Session-Id so JS clients can read it.
+from starlette.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
+)
+
 
 # ALB target group health check hits this path.  Must NOT require auth.
 async def _health(_request: Request) -> JSONResponse:
