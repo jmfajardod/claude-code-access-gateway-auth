@@ -38,3 +38,5 @@ Thumbs.db
 
 # uv
 .python-version
+
+to_validate/
