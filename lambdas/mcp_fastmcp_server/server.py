@@ -412,6 +412,13 @@ async def query_data_catalog(sql: str, database: str | None = None) -> dict:
     declares them int/double. Always `CAST` before aggregating
     (e.g. `SUM(CAST(total_price AS DOUBLE))`).
 
+    Totals & marginals: do NOT sum displayed cell values by hand to
+    produce grand totals or row/column subtotals — long mental arithmetic
+    occasionally drifts. Push the rollup into a single SQL query using
+    `GROUP BY ROLLUP(col_a, col_b)` or `GROUPING SETS (...)`. The rollup
+    yields the per-cell rows AND the subtotals AND the grand total in one
+    query, with all arithmetic done by Athena.
+
     Args:
         sql: The SQL query. Reference tables as `database.table` to query
             across multiple Gold-tagged databases in a single statement.

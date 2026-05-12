@@ -217,9 +217,21 @@ def query_data_catalog(sql: str, database: str | None = None) -> dict:
     CSV stringifies everything). Always ``CAST`` before aggregating, e.g.
     ``SUM(CAST(total_price AS DOUBLE))``.
 
-    Access is gated by LakeFormation: only resources tagged
-    ``LakehouseLayer=Gold`` are readable; other tables yield an
-    access-denied Athena error returned as a structured failure.
+    Totals & marginals: do NOT sum displayed cell values by hand to
+    produce grand totals or row/column subtotals — long mental arithmetic
+    occasionally drifts. Instead, push the rollup into a single SQL query
+    with ``GROUP BY ROLLUP(col_a, col_b)`` or ``GROUPING SETS (...)``::
+
+        SELECT region, channel,
+               SUM(CAST(total_price AS DOUBLE)) AS revenue
+        FROM mcp_poc_db.sales_gold
+        GROUP BY ROLLUP (region, channel)
+        ORDER BY region, channel
+
+    The rollup yields the per-cell rows plus the per-region subtotals,
+    per-channel subtotals (use ``GROUPING SETS`` for both axes plus a
+    grand total), and the grand total — all in one query, all arithmetic
+    done by Athena.
 
     Args:
         sql: The SQL query to execute. Use ``database.table`` to reference
