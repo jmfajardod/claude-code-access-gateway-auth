@@ -16,6 +16,17 @@ class Settings(pydantic_settings.BaseSettings):
     aws_region: str | None = None
     aws_default_region: str | None = None
 
+    # Athena config for query_data_catalog. No default database — callers
+    # supply fully-qualified `db.table` references (or pass `database` to
+    # the tool) because LakeFormation may grant Gold-tag access across
+    # multiple databases.
+    athena_workgroup: str = ""
+    athena_results_bucket: str = ""
+    athena_query_timeout_seconds: int = 600
+    athena_inline_max_bytes: int = 102_400
+    athena_inline_max_rows: int = 1000
+    presigned_url_ttl_seconds: int = 300
+
     @pydantic.computed_field
     @property
     def allowed_domains(self) -> frozenset[str]:

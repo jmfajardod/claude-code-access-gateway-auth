@@ -37,11 +37,11 @@ class StackSettings(BaseSettings):
 
     # Public hostname the ALB will serve.  Must be a valid DNS hostname
     # (no underscores) — ACM rejects underscored names during cert validation.
-    mcp_public_hostname: str = ""           # e.g. mcp.jmfajardo-test-mcp.com
+    mcp_public_hostname: str = ""  
 
     # Route53 hosted zone that owns the apex of the hostname above.
     # Must already exist in this AWS account; CDK will look it up at synth time.
-    route53_hosted_zone_name: str = ""      # e.g. jmfajardo-test-mcp.com
+    route53_hosted_zone_name: str = "" 
 
     # Google OAuth 2.0 Web client_id (created manually in GCP Console).
     # The client_secret is stored in Secrets Manager, NOT in .env.
@@ -51,3 +51,18 @@ class StackSettings(BaseSettings):
     # claim check.  For consumer Gmail the claim is absent — include "gmail.com"
     # to allow it via fallback to the email domain.
     allowed_workspace_domains: str = "gmail.com,boldcf.co"
+
+    # ------------------------------------------------------------------
+    # LakeFormation admin allow-list. Populated from .env so the stack file
+    # doesn't have to hard-code your AWS account ID / IAM user names (which
+    # would be sensitive when committed to a public repo).
+    # ------------------------------------------------------------------
+
+    # Include `arn:aws:iam::<account>:root` in the LF admins list. Useful
+    # so logging in as root via the AWS console can see LF tags / grants.
+    lf_admin_include_root: bool = False
+
+    # Extra LF admin principals to include. Comma-separated IAM-ARN suffixes
+    # (the portion AFTER `arn:aws:iam::<account>:`).
+    # Account ID is templated in at deploy time via Aws.ACCOUNT_ID.
+    lf_extra_admin_iam_paths: str = ""

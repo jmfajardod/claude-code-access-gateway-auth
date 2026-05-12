@@ -11,10 +11,15 @@ from starlette import routing as starlette_routing
 from starlette.middleware import cors as starlette_cors
 
 from config import settings
-from tools import dummy_tool
+from tools import dummy_tool, query_data_catalog
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    force=True,
+)
 _logger = logging.getLogger("data-reports-mcp")
+logging.getLogger("data-reports-mcp").setLevel(logging.INFO)
 
 if settings.is_prod:
     _storage_enc_key = settings.storage_enc_key.get_secret_value()
@@ -47,6 +52,7 @@ else:
     mcp = fastmcp.FastMCP(name="DataReportsMCPServer")
 
 dummy_tool.register(mcp)
+query_data_catalog.register(mcp)
 
 app = mcp.http_app()
 

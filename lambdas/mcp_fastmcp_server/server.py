@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import os
 import statistics
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -66,12 +68,22 @@ _RESULTS_BUCKET = os.environ.get("RESULTS_BUCKET", "")
 _RESULTS_OBJECT_KEY = os.environ.get("RESULTS_OBJECT_KEY", "sample_sales.csv")
 _PRESIGNED_URL_TTL_SECONDS = int(os.environ.get("PRESIGNED_URL_TTL_SECONDS", "300"))
 
+# --- Athena / Glue config (consumed by query_data_catalog) -----------------
+# No default database — callers fully-qualify `db.table` or pass the
+# `database` tool arg, since LF-tag grants can span multiple Gold DBs.
+_ATHENA_WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "")
+_ATHENA_RESULTS_BUCKET = os.environ.get("ATHENA_RESULTS_BUCKET", "")
+_ATHENA_QUERY_TIMEOUT_SECONDS = int(os.environ.get("ATHENA_QUERY_TIMEOUT_SECONDS", "600"))
+_INLINE_MAX_BYTES = int(os.environ.get("ATHENA_INLINE_MAX_BYTES", "102400"))
+_INLINE_MAX_ROWS = int(os.environ.get("ATHENA_INLINE_MAX_ROWS", "1000"))
+
 _SAMPLE_ROW_COUNT = 50
 _TOP_VALUES_MAX = 5
 _LOW_CARDINALITY_THRESHOLD = 30
 _TOOL_VERSION = "1.0.0-fargate-google"
 
 _s3 = boto3.client("s3")
+_athena = boto3.client("athena")
 
 # --- auth provider ---------------------------------------------------------
 
@@ -283,6 +295,219 @@ async def query_data() -> dict:
             "inline": False,
         },
         "next_steps": next_steps,
+        "_meta": {"tool_version": _TOOL_VERSION},
+    }
+
+
+# --- query_data_catalog: SQL against Glue Data Catalog via Athena ---------
+# Tag-based access: LakeFormation restricts the task role to tables tagged
+# LakehouseLayer=Gold. Querying any other table returns an Athena
+# AccessDeniedException surfaced as a structured error.
+
+def _qdc_start_query(sql: str, database: str | None) -> str:
+    kwargs: dict = {"QueryString": sql, "WorkGroup": _ATHENA_WORKGROUP}
+    if database:
+        kwargs["QueryExecutionContext"] = {"Database": database}
+    return _athena.start_query_execution(**kwargs)["QueryExecutionId"]
+
+
+def _qdc_wait_for_query(qid: str) -> dict:
+    deadline = time.time() + _ATHENA_QUERY_TIMEOUT_SECONDS
+    backoff = 0.5
+    while True:
+        execution = _athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        state = execution["Status"]["State"]
+        if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            return execution
+        if time.time() >= deadline:
+            try:
+                _athena.stop_query_execution(QueryExecutionId=qid)
+            except Exception:
+                pass
+            raise TimeoutError(
+                f"Athena query did not finish within {_ATHENA_QUERY_TIMEOUT_SECONDS}s"
+            )
+        time.sleep(backoff)
+        backoff = min(backoff * 1.5, 5.0)
+
+
+def _qdc_parse_s3_uri(uri: str) -> tuple[str, str]:
+    assert uri.startswith("s3://"), f"unexpected Athena output URI {uri!r}"
+    bucket, _, key = uri[5:].partition("/")
+    return bucket, key
+
+
+def _qdc_read_result_csv(output_location: str) -> tuple[list[str], list[list[str]], int]:
+    bucket, key = _qdc_parse_s3_uri(output_location)
+    obj = _s3.get_object(Bucket=bucket, Key=key)
+    size_bytes = int(obj.get("ContentLength", 0))
+    text = obj["Body"].read().decode("utf-8")
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader, [])
+    rows = list(reader)
+    return header, rows, size_bytes
+
+
+def _qdc_error(
+    error_type: str,
+    message: str,
+    *,
+    qid: str | None = None,
+    state: str | None = None,
+    sql: str | None = None,
+) -> dict:
+    body: dict = {
+        "status": "error",
+        "error": {"type": error_type, "message": message},
+        "_meta": {"tool_version": _TOOL_VERSION},
+    }
+    if qid:
+        body["error"]["query_execution_id"] = qid
+    if state:
+        body["error"]["athena_state"] = state
+    if sql:
+        body["error"]["sql"] = sql
+    return body
+
+
+@mcp.tool
+async def query_data_catalog(sql: str, database: str | None = None) -> dict:
+    """Run a SQL query against the Glue Data Catalog via Athena.
+
+    The query MUST be valid Athena SQL (Trino dialect, engine v3).
+    Common dialect notes:
+      - Date literal: `DATE '2024-01-01'` (no Postgres-style `::date`).
+      - Cast: `CAST(x AS type)` only — no `::` casts.
+      - String concat: `||` or `CONCAT(...)`.
+      - Identifier quoting: double quotes (`"col name"`).
+      - String literals: single quotes only (`'value'`).
+      - Regex: `regexp_like(col, 'pattern')` (case-sensitive).
+      - Date math: `date_add('day', 7, col)`, `date_diff('day', a, b)`.
+      - JSON: `json_extract_scalar(col, '$.field')`.
+      - Row limit: `LIMIT n` only — no `TOP n` / `FETCH FIRST`.
+
+    Args:
+        sql: The SQL query. Reference tables as `database.table` to query
+            across multiple Gold-tagged databases in a single statement.
+        database: Optional default database for unqualified table refs.
+            Equivalent to a `USE <database>` prefix.
+
+    Only resources tagged LakehouseLayer=Gold are accessible (enforced by
+    LakeFormation). Querying other tables returns a structured error.
+    Small results (<=100KB, <=1000 rows) are returned inline; larger
+    results return a presigned S3 URL to the query output CSV.
+    """
+    _enforce_domain_or_raise()
+
+    if not _ATHENA_WORKGROUP or not _ATHENA_RESULTS_BUCKET:
+        return _qdc_error(
+            "configuration_error",
+            "Athena env vars not set (ATHENA_WORKGROUP / ATHENA_RESULTS_BUCKET)",
+        )
+    if not isinstance(sql, str) or not sql.strip():
+        return _qdc_error("invalid_input", "sql must be a non-empty string", sql=sql)
+
+    try:
+        qid = _qdc_start_query(sql, database)
+    except Exception as exc:
+        _LOGGER.exception("Failed to start Athena query")
+        return _qdc_error("athena_start_failed", str(exc), sql=sql)
+
+    try:
+        execution = _qdc_wait_for_query(qid)
+    except TimeoutError as exc:
+        return _qdc_error("timeout", str(exc), qid=qid, sql=sql)
+    except Exception as exc:
+        _LOGGER.exception("Failed while polling Athena query")
+        return _qdc_error("athena_poll_failed", str(exc), qid=qid, sql=sql)
+
+    status = execution["Status"]
+    state = status["State"]
+    if state != "SUCCEEDED":
+        raw_reason = status.get("StateChangeReason") or f"Query ended in state {state}"
+        # See Option B note: LF returns TABLE_NOT_FOUND both for missing
+        # tables AND for permission-denied (hidden-deny). Reframe the
+        # message so Claude knows the error is ambiguous, without leaking
+        # whether the table exists.
+        if "TABLE_NOT_FOUND" in raw_reason:
+            err_type = "table_not_accessible"
+            client_message = (
+                f"{raw_reason}  Note: this error is returned either when the "
+                "table does not exist OR when the caller's role lacks "
+                "permission to read it. Through this tool, only tables tagged "
+                "`LakehouseLayer=Gold` are queryable; tables in other layers "
+                "appear as not-found regardless of whether they exist."
+            )
+        else:
+            err_type = "athena_query_failed"
+            client_message = raw_reason
+        return _qdc_error(
+            err_type,
+            client_message,
+            qid=qid,
+            state=state,
+            sql=sql,
+        )
+
+    output_location = execution["ResultConfiguration"]["OutputLocation"]
+    try:
+        header, rows, size_bytes = _qdc_read_result_csv(output_location)
+    except Exception as exc:
+        _LOGGER.exception("Failed to read Athena result CSV")
+        return _qdc_error("result_read_failed", str(exc), qid=qid, sql=sql)
+
+    row_count = len(rows)
+    inline_candidate = [
+        {col: (row[idx] if idx < len(row) else "") for idx, col in enumerate(header)}
+        for row in rows
+    ]
+    inline_serialized_bytes = len(json.dumps(inline_candidate, default=str).encode("utf-8"))
+
+    if row_count <= _INLINE_MAX_ROWS and inline_serialized_bytes <= _INLINE_MAX_BYTES:
+        return {
+            "status": "success",
+            "inline": True,
+            "query_execution_id": qid,
+            "schema": header,
+            "row_count": row_count,
+            "rows": inline_candidate,
+            "next_steps": (
+                f"Returned {row_count:,} rows inline (~{inline_serialized_bytes:,} B). "
+                "Use the rows directly to answer the user's question."
+            ),
+            "_meta": {"tool_version": _TOOL_VERSION},
+        }
+
+    bucket, key = _qdc_parse_s3_uri(output_location)
+    presigned_url = _s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=_PRESIGNED_URL_TTL_SECONDS,
+    )
+    ttl_minutes = max(1, _PRESIGNED_URL_TTL_SECONDS // 60)
+    size_kb = max(1, round(size_bytes / 1024))
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=_PRESIGNED_URL_TTL_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "status": "success",
+        "inline": False,
+        "query_execution_id": qid,
+        "schema": header,
+        "row_count": row_count,
+        "full_results": {
+            "format": "csv",
+            "size_bytes": size_bytes,
+            "presigned_url": presigned_url,
+            "presigned_url_ttl_seconds": _PRESIGNED_URL_TTL_SECONDS,
+            "presigned_url_expires_at": expires_at,
+            "s3_uri": output_location,
+        },
+        "next_steps": (
+            f"Returned {row_count:,} rows (~{size_kb:,} KB) — too large to inline. "
+            f"Tell the user: download the CSV from `full_results.presigned_url` "
+            f"(expires in ~{ttl_minutes} minutes) and drag it into this chat."
+        ),
         "_meta": {"tool_version": _TOOL_VERSION},
     }
 
