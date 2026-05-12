@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -17,8 +18,18 @@ _logger.setLevel(logging.INFO)
 _TOOL_VERSION = "1.0.0-query-data-catalog"
 _SQL_LOG_MAX_LEN = 2000  # truncate very long queries to keep log lines bounded
 
+_ARN_RE = re.compile(r"arn:aws:[a-z0-9-]+:[a-z0-9-]*:\d{12}:[^\s'\"]+")
+
 _athena = boto3.client("athena")
 _s3 = boto3.client("s3")
+
+
+def _redact_arns(msg: str | None) -> str | None:
+    """Replace any AWS ARN substrings with `<arn-redacted>`.
+    """
+    if not msg:
+        return msg
+    return _ARN_RE.sub("<arn-redacted>", msg)
 
 
 def _log_event(level: str, event: str, **fields) -> None:
@@ -162,7 +173,7 @@ def _error(
     """
     body: dict = {
         "status": "error",
-        "error": {"type": error_type, "message": message},
+        "error": {"type": error_type, "message": _redact_arns(message)},
         "_meta": {"tool_version": _TOOL_VERSION},
     }
     if query_execution_id:
@@ -189,6 +200,26 @@ def query_data_catalog(sql: str, database: str | None = None) -> dict:
       - JSON: ``json_extract_scalar(col, '$.field')``.
       - Row limit: ``LIMIT n`` only — no ``TOP n`` / ``FETCH FIRST``.
       - Arrays: ``ARRAY[1, 2, 3]``; unnest via ``CROSS JOIN UNNEST(...)``.
+
+    Schema discovery: do **NOT** use ``DESCRIBE``. Under tag-based
+    LakeFormation, ``DESCRIBE`` calls a Glue path that requires permission
+    on the workgroup's default database (``default``) which this tool's
+    caller lacks; the error you get back is misleading ("not authorized on
+    database/default"). Use ``information_schema`` instead::
+
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'mydb' AND table_name = 'mytable'
+        ORDER BY ordinal_position
+
+    Numeric quirk: numeric columns surface as JSON **strings** in the
+    response even when Glue declares them ``int``/``double`` (the result
+    CSV stringifies everything). Always ``CAST`` before aggregating, e.g.
+    ``SUM(CAST(total_price AS DOUBLE))``.
+
+    Access is gated by LakeFormation: only resources tagged
+    ``LakehouseLayer=Gold`` are readable; other tables yield an
+    access-denied Athena error returned as a structured failure.
 
     Args:
         sql: The SQL query to execute. Use ``database.table`` to reference

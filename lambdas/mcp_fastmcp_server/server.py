@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import os
+import re
 import statistics
 import time
 from collections import Counter
@@ -84,6 +85,18 @@ _TOOL_VERSION = "1.0.0-fargate-google"
 
 _s3 = boto3.client("s3")
 _athena = boto3.client("athena")
+
+# Athena's errors echo the FULL assumed-role ARN (account ID + role name +
+# session id) — sanitize before returning to Claude. Raw text still goes
+# to CloudWatch logs unredacted for ops debugging.
+_ARN_RE = re.compile(r"arn:aws:[a-z0-9-]+:[a-z0-9-]*:\d{12}:[^\s'\"]+")
+
+
+def _qdc_redact_arns(msg: str | None) -> str | None:
+    if not msg:
+        return msg
+    return _ARN_RE.sub("<arn-redacted>", msg)
+
 
 # --- auth provider ---------------------------------------------------------
 
@@ -358,7 +371,9 @@ def _qdc_error(
 ) -> dict:
     body: dict = {
         "status": "error",
-        "error": {"type": error_type, "message": message},
+        # Redact AWS ARNs from anything we surface to Claude — Athena
+        # error strings include the full assumed-role ARN of the caller.
+        "error": {"type": error_type, "message": _qdc_redact_arns(message)},
         "_meta": {"tool_version": _TOOL_VERSION},
     }
     if qid:
@@ -385,6 +400,17 @@ async def query_data_catalog(sql: str, database: str | None = None) -> dict:
       - Date math: `date_add('day', 7, col)`, `date_diff('day', a, b)`.
       - JSON: `json_extract_scalar(col, '$.field')`.
       - Row limit: `LIMIT n` only — no `TOP n` / `FETCH FIRST`.
+
+    Schema discovery: do NOT use `DESCRIBE` — under tag-based LakeFormation
+    it fails with a misleading "not authorized on database/default" error.
+    Use `information_schema` instead:
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'mydb' AND table_name = 'mytable'
+
+    Numeric quirk: numeric columns surface as JSON strings even when Glue
+    declares them int/double. Always `CAST` before aggregating
+    (e.g. `SUM(CAST(total_price AS DOUBLE))`).
 
     Args:
         sql: The SQL query. Reference tables as `database.table` to query
